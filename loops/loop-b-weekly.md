@@ -2,8 +2,8 @@
 
 Type: Scheduled measurement + prioritization (NOT a convergence loop)
 Trigger: weekly host systemd timer -> one-shot container -> claude -p
-Inputs: Search Console API pull + CodeManager baseline (last week's snapshot + Loop A status)
-Output: ranked action queue in CM; targets handed to Loop A; editorial list for human; Discord digest
+Inputs: Search Console API pull + Postgres baseline (last week's snapshot + Loop A status)
+Output: ranked action queue in Postgres; targets handed to Loop A; editorial list for human; Discord digest
 
 ## Important framing
 This does NOT "loop until ranking improves" — you cannot converge a fast loop against a metric that
@@ -15,7 +15,7 @@ loop; next week's GSC pull is the judge of last week's changes.
 - GSC API (last 7d vs prior 7d): query, page, position, CTR, impressions, clicks
 - GSC indexing status per URL (indexed / not)
 - Field CWV / CrUX buckets (Good / Needs-Improvement / Poor) — signal only
-- CodeManager: last week's baseline + Loop A checklist_status per URL
+- Postgres: last week's baseline + Loop A checklist_status per URL
 
 ## Analysis — diff vs last week, then rank opportunities
 1. Striking-distance queries: avg position ~5–15. Highest ROI; small nudges move these.
@@ -26,7 +26,7 @@ loop; next week's GSC pull is the judge of last week's changes.
 6. Field CWV regressions: pages slipping Good -> Needs-Improvement -> signal, not gate.
 
 ## Output / hand-off
-- Write ranked action list to CM seo_weekly.opportunities (with rationale + metric deltas per item).
+- Write ranked action list to Postgres seo_weekly.opportunities (with rationale + metric deltas per item).
 - Hand top N on-page targets (categories 1,2,3,5) to Loop A's queue for next run.
 - Emit query gaps (category 4) as a SEPARATE human-review editorial list — Loop B does not write content.
 - Post a digest to Discord via webhook (top movers, new gaps, indexing flags).
@@ -39,5 +39,5 @@ loop; next week's GSC pull is the judge of last week's changes.
 
 ## Orchestration (plain systemd + flock; see deploy/)
 Host systemd timer (Mon 06:00, Persistent=true) -> flock -> docker compose run --rm loop-runner
-python -m scripts.run_loop_b. State lives in CodeManager, not the scheduler. Revisit OpenClaw only if
+python -m scripts.run_loop_b. State lives in Postgres, not the scheduler. Revisit OpenClaw only if
 this grows to many loops/sites or needs retries + event triggers + channel delivery as first-class.

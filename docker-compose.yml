@@ -1,8 +1,9 @@
 # One-shot loop runner. Host systemd fires `docker compose run --rm loop-runner ...`.
 # NO scheduler inside the container — the host owns scheduling + locking.
 #
-# `codemanager` and the WP MCP are assumed reachable on an existing external docker network so the
-# runner can reach CodeManager by service name. Adjust the network name to match your CM stack.
+# State lives in Neon Postgres (DATABASE_URL in .env), reached over the internet — the runner needs
+# only outbound network access (the default bridge), no shared docker network. GSC / PSI / Anthropic /
+# WP MCP and the optional CodeManager broker are all reached the same way.
 
 services:
   loop-runner:
@@ -17,13 +18,6 @@ services:
       - ./logs:/app/logs
       - ./config:/app/config:ro
       - ./secrets/gsc_sa.json:/run/secrets/gsc_sa.json:ro   # GSC service account, gitignored
-    networks:
-      - cm_net
     # no `command:` here — provided per-invocation by systemd, e.g.:
     #   docker compose run --rm loop-runner python -m scripts.run_loop_b
     restart: "no"
-
-networks:
-  cm_net:
-    external: true
-    name: codemanager_default    # <-- set to the actual network your CodeManager container is on

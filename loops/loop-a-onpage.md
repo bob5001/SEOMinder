@@ -1,7 +1,7 @@
 # Loop A — On-Page / Technical SEO (Signal Sanctuary)
 
 Type: Verifiable loop · Trigger: manual /goal or on-publish · Blast radius: deliberately small in v1
-State store: CodeManager (SEO schema) · Reads/writes via: Signal Sanctuary WP MCP + audit.py
+State store: Neon Postgres (SEO schema, keyed by site) · Reads/writes via: Signal Sanctuary WP MCP + audit.py
 
 ## Objective
 Bring every in-scope page up to a known-good on-page/technical standard, verified against a
@@ -39,7 +39,8 @@ Tier 2 detect+queue in v1; auto-fix only after Elementor-edit path validated on 
   alt text, heading markup, in-body internal links — all require _elementor_data JSON surgery +
   CSS-cache bust. High fragility; do not blindly rewrite the blob.
 Tier 3 flag for human, never auto-fix: any health/medical substance, thin-content rewrite, near-dup merge.
-Graduating a check Tier 2 -> auto-fix is an explicit human decision, logged in CodeManager.
+Graduating a check Tier 2 -> auto-fix is an explicit human decision, logged to the CodeManager broker
+(a governance action, not page state).
 
 ## YMYL boundary (hard rule)
 This is a .health domain making health claims. You may NOT rewrite, soften, strengthen, or "optimize"
@@ -59,7 +60,7 @@ internal links, and technical checks. If a fix needs changing a claim's substanc
 2. Compare against checklist; record each pass/fail.
 3. Fix Tier 1 via MCP meta writes. Detect Tier 2/3 and queue.
 4. Re-verify by re-reading (writes bust caches).
-5. Write per-URL result to CodeManager (seo_page_state): status, changes, timestamp, queued items.
+5. Write per-URL result to Postgres (seo_page_state): status, changes, timestamp, queued items.
 6. Next page. Loop until all in-scope pages green (or queued where auto-fix not allowed).
 
 ## On-publish variant

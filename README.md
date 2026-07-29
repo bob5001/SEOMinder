@@ -11,12 +11,13 @@ config/     <site>.yaml  (per-client seam — domain, scope IDs, thresholds, web
 reports/    committed weekly md history (dashboard-lite)
 deploy/     Dockerfile, requirements.txt, compose is at repo root; systemd unit+timer, wrapper
 logs/       run logs (gitignored)
-INFRA.md    full infra spec: layers, CM schema, script contracts, migration
+INFRA.md    full infra spec: layers, state schema, script contracts, migration
 ```
 
 ## Architecture in one breath
-Definition (git) · Execution (host systemd -> one-shot container) · State (CodeManager) ·
-Presentation (md reports + Discord webhook, a projection of CM — never parallel truth).
+Definition (git) · Execution (host systemd -> one-shot container) · State (Neon Postgres) ·
+Presentation (md reports + Discord webhook, a projection of Postgres — never parallel truth).
+The CodeManager broker is a separate agent-knowledge layer (out-of-band task ledger), not the state store.
 
 - **Loop A** = verifiable on-page checklist -> all-green -> stop. Manual `/goal` or on-publish.
   Tier 1 (Yoast meta) auto-fixes now; Tier 2 (Elementor body) detect+queue; Tier 3 (health claims) human-only.
@@ -30,20 +31,20 @@ Signal (Loop B, slow/aggregate): field CWV, position, CTR, indexing confirmation
 Never gate: Yoast composite, Flesch, third-party DA/DR, vendor GEO scores.
 
 ## Build order
-1. **Infra first** (this deliverable): CM schema, the three scripts, config, container, timer.
-2. Bring up CodeManager SEO schema (see INFRA.md).
+1. **Infra first** (this deliverable): state schema, the three scripts, config, container, timer.
+2. ~~Bring up the Neon Postgres SEO schema (see INFRA.md).~~ **DONE** — project `SEOMinder`, tables + `signalsanctuary` seed row live.
 3. `scripts/audit.py` (PSI API + HTML parse) — no Chromium in V1.
 4. `scripts/gsc_pull.py` (service account, webmasters.readonly).
-5. `scripts/render_report.py` (CM -> md -> Discord webhook).
-6. Wire Loop A manually first (dry-run: detect only, no writes) to validate the checklist against CM.
+5. `scripts/render_report.py` (Postgres -> md -> Discord webhook).
+6. Wire Loop A manually first (dry-run: detect only, no writes) to validate the checklist against Postgres.
 7. Turn on Tier 1 auto-fix for Loop A.
 8. Install the systemd timer for Loop B; verify with `systemctl list-timers`.
 
 ## Setup
 ```
-cp .env.example .env          # fill secrets (gitignored)
+cp .env.example .env          # fill secrets (gitignored) — incl. DATABASE_URL from the Neon console
 mkdir -p secrets && cp /path/to/gsc_sa.json secrets/gsc_sa.json
-# edit config/signalsanctuary.yaml and the network name in docker-compose.yml
+# edit config/signalsanctuary.yaml as needed
 docker compose build
 # dry run:
 docker compose run --rm loop-runner python -m scripts.run_loop_b
