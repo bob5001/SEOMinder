@@ -1,0 +1,16 @@
+# Host systemd service — runs the one-shot container, then exits.
+# Install: copy to /etc/systemd/system/ (edit paths/User), then enable the .timer (not this).
+[Unit]
+Description=Signal Sanctuary SEO Loop B (weekly opportunity sweep)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=robert
+WorkingDirectory=/srv/seo-loops
+# flock prevents a long run from overlapping the next trigger.
+ExecStart=/usr/bin/flock -n /srv/seo-loops/.loop-b.lock \
+    /srv/seo-loops/deploy/run-loop-b.sh
+# Timeout generous: Loop B is a measurement pass, not a convergence loop, but GSC + PSI + agent can take a while.
+TimeoutStartSec=2h

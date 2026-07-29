@@ -1,0 +1,14 @@
+.env
+secrets/
+logs/*.log
+*.lock
+__pycache__/
+*.pyc
+# reports/ is intentionally committed — it's the dashboard-lite history.
+
+# macOS
+.DS_Store
+
+# Staging scaffold — original spec drop, not part of the project
+OriginalClaudeFiles/
+OriginalClaudeFiles.zip

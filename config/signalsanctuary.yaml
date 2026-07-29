@@ -1,0 +1,44 @@
+# Site-specific config. Loop prompts + scripts stay generic; everything here is what changes per client.
+# Client #2 = copy this file, not a fork.
+
+site:
+  name: "Signal Sanctuary"
+  domain: "signalsanctuary.health"
+  base_url: "https://signalsanctuary.health"
+
+gsc:
+  property: "sc-domain:signalsanctuary.health"
+  window_days: 7          # compare last N days vs prior N days
+
+thresholds:
+  title_len:      { min: 50, max: 60 }
+  metadesc_len:   { min: 150, max: 160 }
+  internal_links_out_min: 2
+  internal_links_in_min:  2
+  cwv_lab:                # gate as bands, median of 3 runs
+    lcp_s:  2.5
+    cls:    0.1
+    inp_ms: 200
+  striking_distance: { min_position: 5, max_position: 15 }
+  low_ctr_impressions_min: 100   # only flag low-CTR pages with real impression volume
+
+scope:
+  # Loop A in-scope informational/content pages
+  in_scope_ids: [2384, 2524, 2509, 2183, 2182, 2181, 2180, 2189, 206, 140, 2691]
+  on_publish_post_type: "post"   # /thesignal blog posts auto-run Loop A on publish
+  # Never touch
+  exclude_ids: [1694, 1718, 2184, 2185, 2186, 2187, 2188, 1937]
+  exclude_post_types: ["product"]
+  # Detect + flag, never edit
+  flag_only_ids: [2833]          # "FAQ (Schema Test Copy)" — near-dup / indexability problem
+
+schema_expectations:
+  # page_id or page_type -> expected schema.org type that must be present AND validate
+  faq_page: "FAQPage"
+  sitewide: "Organization"
+
+reporting:
+  reports_dir: "reports"
+  discord: true          # posts summary via DISCORD_WEBHOOK_URL (webhook, not bot)
+
+# Endpoints/secrets are NOT here — they live in .env (public-safe repo).

@@ -1,0 +1,18 @@
+# Weekly timer. Persistent=true catches a missed run if the box was down at trigger time
+# (the anti-rot guarantee — pairs with the seo_run_log start/end records).
+[Unit]
+Description=Weekly trigger for Signal Sanctuary SEO Loop B
+
+[Timer]
+OnCalendar=Mon *-*-* 06:00:00
+Persistent=true
+Unit=seo-loop-b.service
+
+[Install]
+WantedBy=timers.target
+
+# Install:
+#   sudo cp deploy/seo-loop-b.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now seo-loop-b.timer
+#   systemctl list-timers seo-loop-b.timer      # verify next fire
