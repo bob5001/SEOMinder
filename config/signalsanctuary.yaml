@@ -2,6 +2,7 @@
 # Client #2 = copy this file, not a fork.
 
 site:
+  slug: "signalsanctuary"        # tenant key across the seo_* tables (matches sites.site)
   name: "Signal Sanctuary"
   domain: "signalsanctuary.health"
   base_url: "https://signalsanctuary.health"
