@@ -33,9 +33,10 @@ Never gate: Yoast composite, Flesch, third-party DA/DR, vendor GEO scores.
 ## Build order
 1. **Infra first** (this deliverable): state schema, the three scripts, config, container, timer.
 2. ~~Bring up the Neon Postgres SEO schema (see INFRA.md).~~ **DONE** — project `SEOMinder`, tables + `signalsanctuary` seed row live.
-3. `scripts/audit.py` (PSI API + HTML parse) — no Chromium in V1.
-4. `scripts/gsc_pull.py` (service account, webmasters.readonly).
-5. `scripts/render_report.py` (Postgres -> md -> Discord webhook).
+3. ~~`scripts/audit.py` (PSI API + HTML parse) — no Chromium in V1.~~ **DONE** — validated live; PSI path pending `PSI_API_KEY`.
+4. ~~`scripts/gsc_pull.py` (service account, webmasters.readonly).~~ **DONE** — logic unit-checked; full run pending `secrets/gsc_sa.json`.
+5. ~~`scripts/render_report.py` (Postgres -> md -> Discord webhook).~~ **DONE** — md verified; Discord pending `DISCORD_WEBHOOK_URL`.
+   - `scripts/run_loop_a.py` / `run_loop_b.py` thin orchestrators **DONE** (deterministic pipeline). The `claude -p` agent step is staged behind a seam (`scripts/agent.py`, `WIRED=False`) — the next task, needs `ANTHROPIC_API_KEY` + `WP_MCP_TOKEN`.
 6. Wire Loop A manually first (dry-run: detect only, no writes) to validate the checklist against Postgres.
 7. Turn on Tier 1 auto-fix for Loop A.
 8. Install the systemd timer for Loop B; verify with `systemctl list-timers`.
