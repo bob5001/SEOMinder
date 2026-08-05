@@ -8,7 +8,9 @@ site:
   base_url: "https://signalsanctuary.health"
 
 gsc:
-  property: "sc-domain:signalsanctuary.health"
+  # URL-prefix property (service account has Full access here). Switch to
+  # "sc-domain:signalsanctuary.health" only after granting the SA on a verified Domain property.
+  property: "https://signalsanctuary.health/"
   window_days: 7          # compare last N days vs prior N days
 
 thresholds:
