@@ -10,7 +10,9 @@ one call:
 `model_ref` is a {"provider", "model"} dict resolved from config/models.yaml — either the
 routed model for a task (`route_for(task)`) or a bake-off candidate (`candidates_for(task)`).
 Providers are pluggable:
-  - "anthropic"  -> Claude Messages API (structured outputs)
+  - "claude_cli" -> the Claude Code CLI (`claude -p`). Runs on the Pro/Max SUBSCRIPTION,
+                    not the metered API — this is the default for production.
+  - "anthropic"  -> Claude Messages API (structured outputs). METERED: costs API dollars.
   - "openai"     -> the OpenAI Chat Completions wire format, which ALSO covers local
                     runtimes: Ollama, vLLM, LM Studio (just a different base_url).
 Adding a provider = one adapter function in _ADAPTERS.
@@ -29,7 +31,10 @@ Bake-off usage (the other harness builds the scoring; this is the interface it c
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from functools import lru_cache
@@ -185,7 +190,58 @@ def _complete_openai(prov, model, system, prompt, schema, max_tokens):
     return text, usage
 
 
+def _complete_claude_cli(prov, model, system, prompt, schema, max_tokens):
+    """Claude Code CLI (`claude -p`) — runs on the Pro/Max SUBSCRIPTION, not the API meter.
+
+    Two things make this the production default:
+      * No API dollars. `claude` authenticates with the logged-in subscription.
+      * It is just another adapter, so the model-neutral seam is unchanged.
+
+    The cost is per-call overhead: the CLI ships its own large system prompt (~17k cached
+    tokens per invocation) and has a multi-second floor latency. Fine for 11 pages once a
+    week; the bake-off measures whether a local model makes even that unnecessary.
+
+    CRITICAL: ANTHROPIC_API_KEY is scrubbed from the subprocess environment. scripts.config
+    loads .env into this process, and the CLI prefers an API key over the subscription — so
+    leaving it set would silently bill the API for every call. That is the whole trap.
+    """
+    exe = shutil.which("claude")
+    if exe is None:
+        raise RuntimeError("claude CLI not found on PATH — install it or route to another provider.")
+
+    argv = [exe, "-p", prompt, "--output-format", "json", "--model", model,
+            # No tools: this is one-shot structured generation, not an agent loop.
+            "--allowedTools", "", "--strict-mcp-config"]
+    if system:
+        argv += ["--append-system-prompt", system]
+
+    env_ = {k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+
+    proc = subprocess.run(argv, capture_output=True, text=True,
+                          timeout=prov.get("timeout_s", 300), env=env_)
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude CLI exited {proc.returncode}: {proc.stderr.strip()[:500]}")
+
+    envelope = json.loads(proc.stdout)
+    if envelope.get("is_error"):
+        raise RuntimeError(f"claude CLI reported an error: {str(envelope.get('result'))[:500]}")
+
+    u = envelope.get("usage", {})
+    usage = {
+        "input_tokens": u.get("input_tokens", 0),
+        "output_tokens": u.get("output_tokens", 0),
+        # Surfaced so the bake-off can show the CLI's harness overhead honestly.
+        "cache_creation_input_tokens": u.get("cache_creation_input_tokens", 0),
+        "cache_read_input_tokens": u.get("cache_read_input_tokens", 0),
+        # Reported by the CLI even on a subscription, where it bills no API dollars.
+        "reported_cost_usd": envelope.get("total_cost_usd", 0.0),
+    }
+    return envelope.get("result", ""), usage
+
+
 _ADAPTERS: dict[str, Callable] = {
+    "claude_cli": _complete_claude_cli,
     "anthropic": _complete_anthropic,
     "openai": _complete_openai,
 }

@@ -1,0 +1,241 @@
+{
+  "gsc_window": "2026-07-26..2026-08-01 vs 2026-07-19..2026-07-25",
+  "run_date": "2026-08-04",
+  "per_url": [
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/does-turning-off-wifi-at-night-help/",
+      "clicks": 0,
+      "indexed": null,
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_clicks": 0,
+      "delta_position": null,
+      "delta_impressions": -2
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/is-my-router-making-me-sick/",
+      "clicks": 0,
+      "indexed": null,
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_clicks": 0,
+      "delta_position": null,
+      "delta_impressions": -1
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/thesignal/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/how-to-track-patterns-in-your-environment/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/why_engineers_respect_shakti/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/how-to-create-a-calmer-environment-at-home/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/how-does-the-shakti-electromagnetic-stabilizer-work/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/christines-story/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/support/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/common-patterns-people-notice-in-tech-heavy-environments/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/emf-quiz/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/what-to-do-if-you-notice-a-pattern/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    },
+    {
+      "ctr": null,
+      "url": "https://signalsanctuary.health/the-origin-of-shakti-technology/",
+      "clicks": 0,
+      "indexed": true,
+      "coverage": "Submitted and indexed",
+      "position": null,
+      "impressions": 0,
+      "top_queries": [],
+      "delta_position": null
+    }
+  ],
+  "cwv_field": [
+    {
+      "url": "https://signalsanctuary.health/how-does-the-shakti-electromagnetic-stabilizer-work/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    },
+    {
+      "url": "https://signalsanctuary.health/the-origin-of-shakti-technology/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    },
+    {
+      "url": "https://signalsanctuary.health/why_engineers_respect_shakti/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    },
+    {
+      "url": "https://signalsanctuary.health/how-to-track-patterns-in-your-environment/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    },
+    {
+      "url": "https://signalsanctuary.health/common-patterns-people-notice-in-tech-heavy-environments/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    },
+    {
+      "url": "https://signalsanctuary.health/how-to-create-a-calmer-environment-at-home/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    },
+    {
+      "url": "https://signalsanctuary.health/what-to-do-if-you-notice-a-pattern/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    },
+    {
+      "url": "https://signalsanctuary.health/emf-quiz/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    },
+    {
+      "url": "https://signalsanctuary.health/christines-story/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    },
+    {
+      "url": "https://signalsanctuary.health/support/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    },
+    {
+      "url": "https://signalsanctuary.health/thesignal/",
+      "trend": null,
+      "source": "no_data",
+      "cls_bucket": "no_data",
+      "inp_bucket": "no_data",
+      "lcp_bucket": "no_data"
+    }
+  ]
+}

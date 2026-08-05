@@ -101,13 +101,21 @@ def loop_a_prompt(page: dict, cfg: dict) -> str:
     th = cfg.get("thresholds", {})
     t = th.get("title_len", {})
     m = th.get("metadesc_len", {})
+    t_min, t_max = t.get("min", 50), t.get("max", 60)
+    brand = (cfg.get("site", {}) or {}).get("name", "")
+    suffix = f" - {brand}" if brand else ""
     return (
         f"Page: {page.get('url')}\n"
         f"Current title ({page.get('title_len')} chars): {page.get('title')!r}\n"
         f"Current meta description ({page.get('metadesc_len')} chars): {page.get('metadesc')!r}\n"
         f"Page content excerpt: {page.get('content_excerpt', '(not provided)')!r}\n\n"
-        f"Targets: title {t.get('min', 50)}-{t.get('max', 60)} chars, "
+        f"Targets: title {t_min}-{t_max} chars, "
         f"meta description {m.get('min', 150)}-{m.get('max', 160)} chars; both unique and accurate.\n\n"
+        f"Title format: write the COMPLETE literal title exactly as it should render in the "
+        f"<title> tag — it is written to the Yoast title field verbatim, with nothing appended. "
+        f"End it with {suffix!r} so the brand survives in search results, and count those "
+        f"characters toward the {t_min}-{t_max} band. Drop the suffix only if keeping it would "
+        f"push the title past {t_max} characters.\n\n"
         "Tasks:\n"
         "1. If the title or meta description is outside its target band, missing, or weak, propose a "
         "Tier-1 replacement (field yoast_title / yoast_metadesc) that fits the band and reflects the "

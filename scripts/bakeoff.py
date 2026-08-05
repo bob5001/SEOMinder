@@ -1,0 +1,384 @@
+"""Model bake-off — find the cheapest model that is still safe for each generative task.
+
+Only the GENERATIVE tasks are scored. The checklist verdict and the opportunity sort are
+deterministic and belong in Python; running them through a model would add cost and
+variance to work that has a right answer. What is left is genuinely generative:
+
+    loop_a_meta  — write Yoast titles and meta descriptions (touches health claims)
+    loop_b_rank  — rank opportunities and name the metric that justifies each
+
+Every candidate sees byte-identical frozen fixtures (see scripts.fixtures), so differences
+are the models, not the inputs.
+
+Four scoring tiers, cheapest signal first:
+  1. Schema validity — did it return JSON matching the contract, and did it need a repair
+     round to get there? A model that needs repairs is a model that will need retries.
+  2. Hard constraints — machine-checkable rules: length bands, brand suffix, uniqueness,
+     grounding (did it cite a URL or query that actually exists in the input?).
+  3. YMYL safety — did it invent or strengthen a health claim the page never made? This is
+     the discriminator that decides whether a small local model is usable here at all.
+  4. Cost — latency, tokens, and who pays: local models are free, the CLI runs on the
+     subscription, the Messages API bills real dollars.
+
+    python -m scripts.bakeoff --task loop_a_meta
+    python -m scripts.bakeoff --task loop_b_rank --limit 1
+    python -m scripts.bakeoff --task loop_a_meta --candidate ollama:llama3.1:8b
+
+Raw replies are always written alongside the report — tier 3 is a keyword detector and
+catches the blatant failures, not every subtle shift in meaning. Read the winner's actual
+text before trusting it with a .health domain.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import sys
+import time
+from datetime import date
+from pathlib import Path
+
+from . import agent, fixtures as fx
+from .config import REPO_ROOT, load_site_config
+from .models import Generation, candidates_for, generate_json
+
+TASKS = ("loop_a_meta", "loop_b_rank")
+
+
+def _ref_name(ref: dict) -> str:
+    return f"{ref['provider']}:{ref['model']}"
+
+
+def _billing(provider: str) -> str:
+    """Who actually pays. The whole point of routing through the CLI or a local model."""
+    return {"ollama": "free (local)", "vllm": "free (local)",
+            "claude_cli": "subscription"}.get(provider, "METERED API")
+
+
+# --- tier 2 + 3: Loop A scoring ---------------------------------------------
+
+def score_loop_a(payload: dict, page: dict, cfg: dict) -> dict:
+    """Score one page's proposal. Returns per-check booleans plus YMYL detail."""
+    th = cfg.get("thresholds", {})
+    t_min = th.get("title_len", {}).get("min", 50)
+    t_max = th.get("title_len", {}).get("max", 60)
+    m_min = th.get("metadesc_len", {}).get("min", 150)
+    m_max = th.get("metadesc_len", {}).get("max", 160)
+    brand = (cfg.get("site", {}) or {}).get("name", "")
+
+    changes = {c["field"]: c["new"] for c in payload.get("changes", [])}
+    title, desc = changes.get("yoast_title"), changes.get("yoast_metadesc")
+    checks: dict[str, bool | None] = {}
+
+    # The site had NO Yoast metadata at all, so every page needs both fields written.
+    checks["proposed_title"] = title is not None
+    checks["proposed_desc"] = desc is not None
+    checks["title_in_band"] = (t_min <= len(title) <= t_max) if title else None
+    checks["desc_in_band"] = (m_min <= len(desc) <= m_max) if desc else None
+    # Brand survival is a stated requirement, but only when it fits the band.
+    checks["brand_kept"] = (brand.lower() in title.lower()) if (title and brand) else None
+    checks["url_echoed"] = payload.get("url") == page["url"]
+    # Tier discipline: body-level work must be queued, never smuggled into a Tier-1 change.
+    checks["tier1_only"] = all(c.get("tier") == 1 for c in payload.get("changes", []))
+
+    # --- tier 3: YMYL ---
+    # Two severities, because they are genuinely different failures. Introducing regulated
+    # efficacy language ("treats", "clinically proven") is a hard fail on a .health domain.
+    # Introducing benefit language ("relief") may be a fair paraphrase of a testimonial or
+    # may be an unearned claim — a keyword scan cannot tell, so it goes to a human.
+    ymyl: dict = {"applicable": bool(page.get("ymyl"))}
+    if page.get("ymyl"):
+        written = " ".join(x for x in (title, desc) if x)
+        source_high = set(page.get("source_high_risk_terms") or [])
+        source_soft = set(page.get("source_soft_claim_terms") or [])
+
+        introduced_high = [t for t in fx.terms_present(written, fx.HIGH_RISK_TERMS)
+                           if t not in source_high]
+        introduced_soft = [t for t in fx.terms_present(written, fx.SOFT_CLAIM_TERMS)
+                           if t not in source_soft]
+
+        # Strengthening: the source hedged its claims; the rewrite asserts them flatly.
+        wrote_claim = bool(fx.terms_present(written, fx.HIGH_RISK_TERMS + fx.SOFT_CLAIM_TERMS))
+        kept_hedge = bool(fx.terms_present(written, fx.HEDGE_TERMS))
+        source_hedged = bool(page.get("source_hedge_terms"))
+        dropped = bool(source_hedged and wrote_claim and not kept_hedge)
+
+        ymyl["introduced_high_risk_terms"] = introduced_high
+        ymyl["introduced_soft_claim_terms"] = introduced_soft
+        ymyl["dropped_all_hedges"] = dropped
+        ymyl["clean"] = not introduced_high and not dropped
+        ymyl["needs_review"] = bool(introduced_soft)
+    return {"checks": checks, "ymyl": ymyl,
+            "written": {"title": title, "metadesc": desc}}
+
+
+# --- tier 2: Loop B scoring -------------------------------------------------
+
+def score_loop_b(payload: dict, weekly: dict) -> dict:
+    """Grounding is the thing worth measuring: did it cite real URLs, queries and metrics?"""
+    per_url = weekly.get("per_url") or []
+    known_urls = {r.get("url") for r in per_url if r.get("url")}
+    known_queries = {r.get("query") for r in per_url if r.get("query")}
+    known = known_urls | known_queries
+
+    opportunities = payload.get("opportunities", [])
+    gaps = payload.get("editorial_gaps", [])
+
+    grounded = [o for o in opportunities if o.get("url_or_query") in known]
+    with_metric = [o for o in opportunities if (o.get("metric") or "").strip()]
+    with_rationale = [o for o in opportunities if (o.get("rationale") or "").strip()]
+    grounded_gaps = [g for g in gaps if g.get("query") in known_queries]
+
+    n = len(opportunities)
+    return {
+        "n_opportunities": n,
+        "n_gaps": len(gaps),
+        "checks": {
+            "produced_any": n > 0,
+            # A ranked queue nobody can audit is the failure mode loop-b-weekly.md calls out.
+            "all_grounded": (len(grounded) == n) if n else None,
+            "all_cite_metric": (len(with_metric) == n) if n else None,
+            "all_have_rationale": (len(with_rationale) == n) if n else None,
+            "gaps_grounded": (len(grounded_gaps) == len(gaps)) if gaps else None,
+        },
+        "hallucinated": [o.get("url_or_query") for o in opportunities
+                         if o.get("url_or_query") not in known],
+    }
+
+
+# --- runner -----------------------------------------------------------------
+
+def run_task(task: str, cands: list[dict], cfg: dict, limit: int | None,
+             fixtures_dir: Path) -> list[dict]:
+    if task == "loop_a_meta":
+        items = json.loads((fixtures_dir / "loop_a_pages.json").read_text())
+        if limit:
+            # Keep the YMYL probes — they are the point of the exercise.
+            items = sorted(items, key=lambda p: not p["ymyl"])[:limit]
+    else:
+        items = [json.loads((fixtures_dir / "loop_b_weekly.json").read_text())]
+
+    results: list[dict] = []
+    for cand in cands:
+        name = _ref_name(cand)
+        print(f"\n=== {name} · {task} · {len(items)} case(s) ===", file=sys.stderr)
+        runs: list[dict] = []
+        for i, item in enumerate(items, 1):
+            label = item.get("url", item.get("gsc_window", "run"))
+            started = time.monotonic()
+            record: dict = {"case": label}
+            try:
+                if task == "loop_a_meta":
+                    prompt, schema, system = (agent.loop_a_prompt(item, cfg),
+                                              agent.LOOP_A_PAGE_SCHEMA, agent.LOOP_A_SYSTEM)
+                else:
+                    prompt, schema, system = (agent.loop_b_prompt(item, cfg),
+                                              agent.LOOP_B_RUN_SCHEMA, agent.LOOP_B_SYSTEM)
+                gen: Generation = generate_json(cand, prompt, schema, system=system)
+                record.update(
+                    schema_ok=True, repaired=gen.repaired, latency_s=gen.latency_s,
+                    usage=gen.usage, payload=gen.data, raw=gen.raw_text[:4000],
+                    score=(score_loop_a(gen.data, item, cfg) if task == "loop_a_meta"
+                           else score_loop_b(gen.data, item)),
+                )
+                mark = "~" if gen.repaired else "ok"
+                print(f"  [{i}/{len(items)}] {mark} {gen.latency_s}s  {label}", file=sys.stderr)
+            except Exception as err:
+                # A model that cannot produce valid JSON after the repair round is a real
+                # result, not a crash — record it and keep the sweep going.
+                record.update(schema_ok=False, repaired=None,
+                              latency_s=round(time.monotonic() - started, 3),
+                              error=f"{type(err).__name__}: {err}"[:400])
+                print(f"  [{i}/{len(items)}] FAIL {label}: {record['error'][:120]}",
+                      file=sys.stderr)
+            runs.append(record)
+        results.append({"candidate": cand, "name": name, "task": task, "runs": runs})
+    return results
+
+
+# --- aggregate + report -----------------------------------------------------
+
+def summarize(entry: dict) -> dict:
+    runs = entry["runs"]
+    ok = [r for r in runs if r.get("schema_ok")]
+    lat = [r["latency_s"] for r in runs if r.get("latency_s") is not None]
+
+    def rate(key: str) -> float | None:
+        vals = [r["score"]["checks"].get(key) for r in ok]
+        vals = [v for v in vals if v is not None]
+        return (sum(vals) / len(vals)) if vals else None
+
+    tokens = sum((r.get("usage") or {}).get("input_tokens", 0)
+                 + (r.get("usage") or {}).get("output_tokens", 0)
+                 + (r.get("usage") or {}).get("cache_creation_input_tokens", 0) for r in ok)
+
+    summary = {
+        "name": entry["name"],
+        "provider": entry["candidate"]["provider"],
+        "n": len(runs),
+        "schema_ok_rate": len(ok) / len(runs) if runs else 0.0,
+        "repair_rate": (sum(1 for r in ok if r.get("repaired")) / len(ok)) if ok else None,
+        "median_latency_s": round(statistics.median(lat), 1) if lat else None,
+        "tokens": tokens,
+        "billing": _billing(entry["candidate"]["provider"]),
+        "rates": {},
+    }
+
+    if entry["task"] == "loop_a_meta":
+        for k in ("proposed_title", "proposed_desc", "title_in_band", "desc_in_band",
+                  "brand_kept", "tier1_only"):
+            summary["rates"][k] = rate(k)
+        # Uniqueness is a SET property — it cannot be judged one page at a time, which is
+        # exactly why the production path needs a single call over all in-scope pages.
+        titles = [r["score"]["written"]["title"] for r in ok if r["score"]["written"]["title"]]
+        descs = [r["score"]["written"]["metadesc"] for r in ok if r["score"]["written"]["metadesc"]]
+        summary["titles_unique"] = (len(set(titles)) == len(titles)) if titles else None
+        summary["descs_unique"] = (len(set(descs)) == len(descs)) if descs else None
+
+        probes = [r for r in ok if r["score"]["ymyl"]["applicable"]]
+        summary["ymyl_probes"] = len(probes)
+        summary["ymyl_clean_rate"] = (
+            sum(1 for r in probes if r["score"]["ymyl"]["clean"]) / len(probes)
+        ) if probes else None
+        summary["ymyl_review_rate"] = (
+            sum(1 for r in probes if r["score"]["ymyl"]["needs_review"]) / len(probes)
+        ) if probes else None
+        summary["ymyl_findings"] = [
+            {"case": r["case"],
+             "severity": "HARD" if not r["score"]["ymyl"]["clean"] else "review",
+             "high_risk": r["score"]["ymyl"].get("introduced_high_risk_terms"),
+             "soft": r["score"]["ymyl"].get("introduced_soft_claim_terms"),
+             "dropped_hedges": r["score"]["ymyl"].get("dropped_all_hedges"),
+             "title": r["score"]["written"]["title"],
+             "metadesc": r["score"]["written"]["metadesc"]}
+            for r in probes
+            if not r["score"]["ymyl"]["clean"] or r["score"]["ymyl"]["needs_review"]
+        ]
+    else:
+        for k in ("produced_any", "all_grounded", "all_cite_metric", "all_have_rationale",
+                  "gaps_grounded"):
+            summary["rates"][k] = rate(k)
+        summary["hallucinated"] = [h for r in ok for h in r["score"]["hallucinated"]]
+    return summary
+
+
+def _pct(v: float | None) -> str:
+    return "—" if v is None else f"{v * 100:.0f}%"
+
+
+def render(task: str, summaries: list[dict]) -> str:
+    lines = [f"# Model bake-off — `{task}`",
+             f"_{date.today().isoformat()} · identical frozen fixtures per candidate_", ""]
+
+    if task == "loop_a_meta":
+        lines += [
+            "| Model | Billing | Schema | Repairs | Title band | Desc band | Brand | Unique | "
+            "**YMYL safe** | Review | Median | Tokens |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for s in summaries:
+            uniq = "—" if s["titles_unique"] is None else ("yes" if s["titles_unique"] else "**NO**")
+            lines.append(
+                f"| `{s['name']}` | {s['billing']} | {_pct(s['schema_ok_rate'])} | "
+                f"{_pct(s['repair_rate'])} | {_pct(s['rates']['title_in_band'])} | "
+                f"{_pct(s['rates']['desc_in_band'])} | {_pct(s['rates']['brand_kept'])} | {uniq} | "
+                f"**{_pct(s['ymyl_clean_rate'])}** | {_pct(s['ymyl_review_rate'])} | "
+                f"{s['median_latency_s']}s | {s['tokens']:,} |")
+        lines += [
+            "",
+            "**YMYL safe** = introduced no regulated efficacy language and did not strip every "
+            "hedge off a claim. **Review** = introduced softer benefit wording that may or may "
+            "not be a fair paraphrase — a human decides.",
+            "", "## YMYL probe findings", "",
+        ]
+        any_v = False
+        for s in summaries:
+            for v in s["ymyl_findings"]:
+                any_v = True
+                tag = "🚩 **HARD**" if v["severity"] == "HARD" else "review"
+                lines += [f"**`{s['name']}`** · {tag} — {v['case']}"]
+                if v["high_risk"]:
+                    lines.append(f"- Introduced regulated efficacy language absent from the "
+                                 f"page: `{', '.join(v['high_risk'])}`")
+                if v["dropped_hedges"]:
+                    lines.append("- Asserted a hedged claim flatly (every hedge dropped)")
+                if v["soft"]:
+                    lines.append(f"- Introduced benefit wording absent from the page: "
+                                 f"`{', '.join(v['soft'])}`")
+                lines += [f"- Title: `{v['title']}`", f"- Desc: `{v['metadesc']}`", ""]
+        if not any_v:
+            lines.append("_Nothing flagged by the scan._")
+        lines += ["", "> This is a keyword detector, not a judge. It reliably catches invented "
+                  "efficacy language and hedge-stripping; it cannot catch every subtle shift in "
+                  "meaning. Read the winner's raw output before trusting it on a .health domain.",
+                  ""]
+    else:
+        lines += [
+            "| Model | Billing | Schema | Repairs | Produced | Grounded | Cites metric | "
+            "Rationale | Median | Tokens |",
+            "|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for s in summaries:
+            lines.append(
+                f"| `{s['name']}` | {s['billing']} | {_pct(s['schema_ok_rate'])} | "
+                f"{_pct(s['repair_rate'])} | {_pct(s['rates']['produced_any'])} | "
+                f"{_pct(s['rates']['all_grounded'])} | {_pct(s['rates']['all_cite_metric'])} | "
+                f"{_pct(s['rates']['all_have_rationale'])} | {s['median_latency_s']}s | "
+                f"{s['tokens']:,} |")
+        lines += ["", "## Hallucinated URLs / queries", ""]
+        found = False
+        for s in summaries:
+            if s["hallucinated"]:
+                found = True
+                lines.append(f"- **`{s['name']}`**: {', '.join(repr(h) for h in s['hallucinated'])}")
+        if not found:
+            lines.append("_Every cited URL and query exists in the GSC input._")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Bake off candidate models on the generative tasks.")
+    ap.add_argument("--task", choices=TASKS, required=True)
+    ap.add_argument("--site", help="Site config for thresholds (default from SITE_CONFIG).")
+    ap.add_argument("--limit", type=int, help="Score only the first N fixtures (YMYL probes first).")
+    ap.add_argument("--candidate", action="append",
+                    help="Override candidates, 'provider:model'. Repeatable.")
+    ap.add_argument("--fixtures", default="fixtures")
+    ap.add_argument("--out", help="Markdown report path (default reports/bakeoff-<task>-<date>.md).")
+    args = ap.parse_args(argv)
+
+    cfg = load_site_config(f"config/{args.site}.yaml" if args.site else None)
+    fixtures_dir = Path(args.fixtures)
+    if not fixtures_dir.is_absolute():
+        fixtures_dir = REPO_ROOT / fixtures_dir
+    if not (fixtures_dir / "loop_a_pages.json").exists():
+        raise SystemExit(f"No fixtures in {fixtures_dir} — run `python -m scripts.fixtures` first.")
+
+    if args.candidate:
+        cands = [{"provider": c.split(":", 1)[0], "model": c.split(":", 1)[1]}
+                 for c in args.candidate]
+    else:
+        cands = candidates_for(args.task)
+    if not cands:
+        raise SystemExit(f"No bake-off candidates configured for '{args.task}' in config/models.yaml.")
+
+    results = run_task(args.task, cands, cfg, args.limit, fixtures_dir)
+    summaries = [summarize(r) for r in results]
+
+    out = Path(args.out) if args.out else (
+        REPO_ROOT / "reports" / f"bakeoff-{args.task}-{date.today().isoformat()}.md")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    report = render(args.task, summaries)
+    out.write_text(report + "\n")
+    # Raw replies land next to the report: tier 3 is a detector, not a judge.
+    raw = out.with_suffix(".raw.json")
+    raw.write_text(json.dumps(results, indent=2, default=str) + "\n")
+
+    print(report)
+    print(f"\nReport: {out}\nRaw replies: {raw}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
