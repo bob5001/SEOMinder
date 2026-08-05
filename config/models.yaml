@@ -1,0 +1,43 @@
+# Model routing + provider definitions for the agent step. NON-SECRET (committed, public-safe).
+# API keys live in .env, referenced by api_key_env below. Local runtimes (Ollama, vLLM,
+# LM Studio) speak the OpenAI wire format and need no key.
+#
+# The agent step is structured-JSON generation, not an agentic tool loop, so ANY model that
+# can return JSON works — including local ones. Swap freely; the bake-off scores candidates.
+
+providers:
+  anthropic:
+    kind: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+  openai:
+    kind: openai                        # OpenAI-compatible wire format
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+  ollama:
+    kind: openai                        # local — Ollama's OpenAI-compatible endpoint
+    base_url: http://localhost:11434/v1
+    api_key_env: null                   # local, no key
+  vllm:
+    kind: openai                        # local — vLLM OpenAI server
+    base_url: http://localhost:8000/v1
+    api_key_env: null
+
+# Production routing: task -> which model runs it.
+# YMYL content generation (writes to a .health site) -> capable model.
+# Analysis / ranking (no content writes) -> cheaper, or local.
+routing:
+  loop_a_meta: { provider: anthropic, model: claude-opus-4-8 }   # Yoast meta/alt text -> capable
+  loop_b_rank: { provider: anthropic, model: claude-sonnet-5 }   # opportunity ranking + rationale
+
+# Bake-off candidates to score per task (scripts.models.candidates_for(task)).
+# Replace with whatever you can serve locally + a cloud baseline.
+bakeoff:
+  loop_a_meta:
+    - { provider: anthropic, model: claude-opus-4-8 }
+    - { provider: anthropic, model: claude-sonnet-5 }
+    - { provider: ollama,    model: qwen2.5:14b-instruct }
+    - { provider: ollama,    model: llama3.1:8b-instruct }
+  loop_b_rank:
+    - { provider: anthropic, model: claude-sonnet-5 }
+    - { provider: ollama,    model: qwen2.5:14b-instruct }
+    - { provider: ollama,    model: llama3.1:8b-instruct }

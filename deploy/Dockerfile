@@ -1,14 +1,7 @@
-# Pure API-client runner. No Chromium in V1 (PSI API does Lighthouse server-side).
+# Pure-Python API-client runner. No Chromium in V1 (PSI API does Lighthouse server-side).
+# No Node / Claude Code CLI: the agent step is model-agnostic structured-JSON generation via
+# provider SDKs (anthropic / openai-compatible, incl. local Ollama/vLLM), not `claude -p`.
 FROM python:3.12-slim
-
-# Node + Claude Code CLI for the `claude -p` agent-judgment step
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates gnupg \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code \
-    && apt-get purge -y curl gnupg && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

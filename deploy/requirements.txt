@@ -5,3 +5,7 @@ google-api-python-client>=2.130
 google-auth>=2.30
 PyYAML>=6.0
 psycopg[binary]>=3.2
+# Agent step (model-agnostic structured JSON): provider adapters + schema validation.
+anthropic>=0.69          # Claude provider (structured outputs)
+openai>=1.40             # OpenAI-compatible provider — also Ollama / vLLM / LM Studio via base_url
+jsonschema>=4.20
