@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import statistics
 import sys
 import time
 from datetime import date
@@ -106,8 +105,13 @@ def score_loop_a(payload: dict, page: dict, cfg: dict) -> dict:
         ymyl["introduced_high_risk_terms"] = introduced_high
         ymyl["introduced_soft_claim_terms"] = introduced_soft
         ymyl["dropped_all_hedges"] = dropped
-        ymyl["clean"] = not introduced_high and not dropped
-        ymyl["needs_review"] = bool(introduced_soft)
+        # Only introduced efficacy language is a hard fail. Hedge-stripping was tried as one
+        # and produced a false positive on the page that explicitly says the product "did not
+        # originate as a health product" — a purely technical sentence about EMI in audio gear
+        # carries no hedge because it needs none. A pass/fail column has to stay precise, so
+        # ambiguity routes to a human instead of failing a model.
+        ymyl["clean"] = not introduced_high
+        ymyl["needs_review"] = bool(introduced_soft or dropped)
     return {"checks": checks, "ymyl": ymyl,
             "written": {"title": title, "metadesc": desc}}
 
@@ -161,104 +165,116 @@ def run_task(task: str, cands: list[dict], cfg: dict, limit: int | None,
     results: list[dict] = []
     for cand in cands:
         name = _ref_name(cand)
-        print(f"\n=== {name} · {task} · {len(items)} case(s) ===", file=sys.stderr)
-        runs: list[dict] = []
-        for i, item in enumerate(items, 1):
-            label = item.get("url", item.get("gsc_window", "run"))
-            started = time.monotonic()
-            record: dict = {"case": label}
-            try:
-                if task == "loop_a_meta":
-                    prompt, schema, system = (agent.loop_a_prompt(item, cfg),
-                                              agent.LOOP_A_PAGE_SCHEMA, agent.LOOP_A_SYSTEM)
-                else:
-                    prompt, schema, system = (agent.loop_b_prompt(item, cfg),
-                                              agent.LOOP_B_RUN_SCHEMA, agent.LOOP_B_SYSTEM)
-                gen: Generation = generate_json(cand, prompt, schema, system=system)
-                record.update(
-                    schema_ok=True, repaired=gen.repaired, latency_s=gen.latency_s,
-                    usage=gen.usage, payload=gen.data, raw=gen.raw_text[:4000],
-                    score=(score_loop_a(gen.data, item, cfg) if task == "loop_a_meta"
-                           else score_loop_b(gen.data, item)),
-                )
-                mark = "~" if gen.repaired else "ok"
-                print(f"  [{i}/{len(items)}] {mark} {gen.latency_s}s  {label}", file=sys.stderr)
-            except Exception as err:
-                # A model that cannot produce valid JSON after the repair round is a real
-                # result, not a crash — record it and keep the sweep going.
-                record.update(schema_ok=False, repaired=None,
-                              latency_s=round(time.monotonic() - started, 3),
-                              error=f"{type(err).__name__}: {err}"[:400])
-                print(f"  [{i}/{len(items)}] FAIL {label}: {record['error'][:120]}",
-                      file=sys.stderr)
-            runs.append(record)
-        results.append({"candidate": cand, "name": name, "task": task, "runs": runs})
+        started = time.monotonic()
+        # ONE call per candidate — matching production. Loop A is a single batch over the
+        # whole in-scope set (uniqueness is a set property); Loop B is one weekly run.
+        print(f"\n=== {name} · {task} · 1 call over {len(items)} page(s) ===", file=sys.stderr)
+        record: dict = {}
+        try:
+            # Call the PRODUCTION entry points, not a parallel copy of them. Anything the
+            # bake-off measures — prompt, schema, token budget — is then by construction
+            # what Loop A and Loop B will actually send.
+            gen: Generation = (agent.propose_loop_a(items, cfg, model_ref=cand)
+                               if task == "loop_a_meta"
+                               else agent.propose_loop_b(items[0], cfg, model_ref=cand))
+            record.update(schema_ok=True, repaired=gen.repaired, latency_s=gen.latency_s,
+                          usage=gen.usage, payload=gen.data, raw=gen.raw_text[:8000])
+
+            if task == "loop_a_meta":
+                # Reconciliation is production's gate too — a batch that loses a page or
+                # returns duplicate metadata never reaches the write path.
+                check = agent.reconcile(gen.data, items)
+                record["reconcile"] = {"ok": check["ok"], "errors": check["errors"]}
+                record["pages"] = [
+                    ({"case": item["url"], "missing": True}
+                     if check["by_url"].get(item["url"]) is None else
+                     {"case": item["url"], "missing": False,
+                      **score_loop_a(check["by_url"][item["url"]], item, cfg)})
+                    for item in items
+                ]
+                got = sum(1 for p in record["pages"] if not p["missing"])
+                note = "" if check["ok"] else f"  ⚠ {'; '.join(check['errors'])[:160]}"
+                print(f"  {'~' if gen.repaired else 'ok'} {gen.latency_s}s  "
+                      f"{got}/{len(items)} pages{note}", file=sys.stderr)
+            else:
+                record["score"] = score_loop_b(gen.data, items[0])
+                print(f"  {'~' if gen.repaired else 'ok'} {gen.latency_s}s  "
+                      f"{record['score']['n_opportunities']} opportunities", file=sys.stderr)
+        except Exception as err:
+            # A model that cannot produce valid JSON after the repair round is a real
+            # result, not a crash — record it and keep the sweep going.
+            record.update(schema_ok=False, repaired=None,
+                          latency_s=round(time.monotonic() - started, 3),
+                          error=f"{type(err).__name__}: {err}"[:400])
+            print(f"  FAIL: {record['error'][:160]}", file=sys.stderr)
+        results.append({"candidate": cand, "name": name, "task": task,
+                        "n_items": len(items), "call": record})
     return results
 
 
 # --- aggregate + report -----------------------------------------------------
 
 def summarize(entry: dict) -> dict:
-    runs = entry["runs"]
-    ok = [r for r in runs if r.get("schema_ok")]
-    lat = [r["latency_s"] for r in runs if r.get("latency_s") is not None]
-
-    def rate(key: str) -> float | None:
-        vals = [r["score"]["checks"].get(key) for r in ok]
-        vals = [v for v in vals if v is not None]
-        return (sum(vals) / len(vals)) if vals else None
-
-    tokens = sum((r.get("usage") or {}).get("input_tokens", 0)
-                 + (r.get("usage") or {}).get("output_tokens", 0)
-                 + (r.get("usage") or {}).get("cache_creation_input_tokens", 0) for r in ok)
-
+    call = entry["call"]
+    usage = call.get("usage") or {}
     summary = {
         "name": entry["name"],
         "provider": entry["candidate"]["provider"],
-        "n": len(runs),
-        "schema_ok_rate": len(ok) / len(runs) if runs else 0.0,
-        "repair_rate": (sum(1 for r in ok if r.get("repaired")) / len(ok)) if ok else None,
-        "median_latency_s": round(statistics.median(lat), 1) if lat else None,
-        "tokens": tokens,
+        "n_items": entry["n_items"],
+        "schema_ok": bool(call.get("schema_ok")),
+        "repaired": call.get("repaired"),
+        "latency_s": call.get("latency_s"),
+        "tokens": (usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                   + usage.get("cache_creation_input_tokens", 0)),
         "billing": _billing(entry["candidate"]["provider"]),
+        "error": call.get("error"),
         "rates": {},
     }
 
     if entry["task"] == "loop_a_meta":
+        pages = [p for p in call.get("pages", []) if not p.get("missing")]
+        summary["coverage"] = (len(pages) / entry["n_items"]) if entry["n_items"] else None
+        summary["reconciled"] = (call.get("reconcile") or {}).get("ok")
+        summary["reconcile_errors"] = (call.get("reconcile") or {}).get("errors", [])
+
+        def rate(key: str) -> float | None:
+            vals = [p["checks"].get(key) for p in pages]
+            vals = [v for v in vals if v is not None]
+            return (sum(vals) / len(vals)) if vals else None
+
         for k in ("proposed_title", "proposed_desc", "title_in_band", "desc_in_band",
-                  "brand_kept", "tier1_only"):
+                  "brand_kept", "tier1_only", "url_echoed"):
             summary["rates"][k] = rate(k)
-        # Uniqueness is a SET property — it cannot be judged one page at a time, which is
-        # exactly why the production path needs a single call over all in-scope pages.
-        titles = [r["score"]["written"]["title"] for r in ok if r["score"]["written"]["title"]]
-        descs = [r["score"]["written"]["metadesc"] for r in ok if r["score"]["written"]["metadesc"]]
+
+        # Uniqueness is the whole reason this is one call. Now it is a genuine pass/fail:
+        # the model saw every page at once and had no excuse to repeat itself.
+        titles = [p["written"]["title"] for p in pages if p["written"]["title"]]
+        descs = [p["written"]["metadesc"] for p in pages if p["written"]["metadesc"]]
         summary["titles_unique"] = (len(set(titles)) == len(titles)) if titles else None
         summary["descs_unique"] = (len(set(descs)) == len(descs)) if descs else None
 
-        probes = [r for r in ok if r["score"]["ymyl"]["applicable"]]
+        probes = [p for p in pages if p["ymyl"]["applicable"]]
         summary["ymyl_probes"] = len(probes)
         summary["ymyl_clean_rate"] = (
-            sum(1 for r in probes if r["score"]["ymyl"]["clean"]) / len(probes)
-        ) if probes else None
+            sum(1 for p in probes if p["ymyl"]["clean"]) / len(probes)) if probes else None
         summary["ymyl_review_rate"] = (
-            sum(1 for r in probes if r["score"]["ymyl"]["needs_review"]) / len(probes)
-        ) if probes else None
+            sum(1 for p in probes if p["ymyl"]["needs_review"]) / len(probes)) if probes else None
         summary["ymyl_findings"] = [
-            {"case": r["case"],
-             "severity": "HARD" if not r["score"]["ymyl"]["clean"] else "review",
-             "high_risk": r["score"]["ymyl"].get("introduced_high_risk_terms"),
-             "soft": r["score"]["ymyl"].get("introduced_soft_claim_terms"),
-             "dropped_hedges": r["score"]["ymyl"].get("dropped_all_hedges"),
-             "title": r["score"]["written"]["title"],
-             "metadesc": r["score"]["written"]["metadesc"]}
-            for r in probes
-            if not r["score"]["ymyl"]["clean"] or r["score"]["ymyl"]["needs_review"]
+            {"case": p["case"],
+             "severity": "HARD" if not p["ymyl"]["clean"] else "review",
+             "high_risk": p["ymyl"].get("introduced_high_risk_terms"),
+             "soft": p["ymyl"].get("introduced_soft_claim_terms"),
+             "dropped_hedges": p["ymyl"].get("dropped_all_hedges"),
+             "title": p["written"]["title"],
+             "metadesc": p["written"]["metadesc"]}
+            for p in probes if not p["ymyl"]["clean"] or p["ymyl"]["needs_review"]
         ]
     else:
+        score = call.get("score") or {}
         for k in ("produced_any", "all_grounded", "all_cite_metric", "all_have_rationale",
                   "gaps_grounded"):
-            summary["rates"][k] = rate(k)
-        summary["hallucinated"] = [h for r in ok for h in r["score"]["hallucinated"]]
+            summary["rates"][k] = (score.get("checks") or {}).get(k)
+        summary["hallucinated"] = score.get("hallucinated", [])
     return summary
 
 
@@ -266,29 +282,52 @@ def _pct(v: float | None) -> str:
     return "—" if v is None else f"{v * 100:.0f}%"
 
 
+def _yn(v: bool | None) -> str:
+    return "—" if v is None else ("yes" if v else "**NO**")
+
+
 def render(task: str, summaries: list[dict]) -> str:
+    n = summaries[0]["n_items"] if summaries else 0
     lines = [f"# Model bake-off — `{task}`",
-             f"_{date.today().isoformat()} · identical frozen fixtures per candidate_", ""]
+             f"_{date.today().isoformat()} · one call per candidate over {n} identical frozen "
+             f"page(s)_", ""]
 
     if task == "loop_a_meta":
         lines += [
-            "| Model | Billing | Schema | Repairs | Title band | Desc band | Brand | Unique | "
-            "**YMYL safe** | Review | Median | Tokens |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|",
+            "| Model | Billing | JSON | Repair | Coverage | Title band | Desc band | Brand | "
+            "Unique | **YMYL safe** | Review | Latency | Tokens |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for s in summaries:
-            uniq = "—" if s["titles_unique"] is None else ("yes" if s["titles_unique"] else "**NO**")
+            if not s["schema_ok"]:
+                lines.append(
+                    f"| `{s['name']}` | {s['billing']} | **fail** | — | — | — | — | — | — | — | "
+                    f"— | {s['latency_s']}s | 0 |")
+                continue
+            uniq = _yn(s["titles_unique"] and s["descs_unique"])
             lines.append(
-                f"| `{s['name']}` | {s['billing']} | {_pct(s['schema_ok_rate'])} | "
-                f"{_pct(s['repair_rate'])} | {_pct(s['rates']['title_in_band'])} | "
+                f"| `{s['name']}` | {s['billing']} | ok | {_yn(s['repaired'])} | "
+                f"{_pct(s['coverage'])} | {_pct(s['rates']['title_in_band'])} | "
                 f"{_pct(s['rates']['desc_in_band'])} | {_pct(s['rates']['brand_kept'])} | {uniq} | "
                 f"**{_pct(s['ymyl_clean_rate'])}** | {_pct(s['ymyl_review_rate'])} | "
-                f"{s['median_latency_s']}s | {s['tokens']:,} |")
+                f"{s['latency_s']}s | {s['tokens']:,} |")
+
+        failed = [s for s in summaries if not s["schema_ok"]]
+        if failed:
+            lines += ["", "## Could not return valid JSON", ""]
+            lines += [f"- **`{s['name']}`**: `{s['error']}`" for s in failed]
+
+        broke = [s for s in summaries if s["schema_ok"] and s["reconciled"] is False]
+        if broke:
+            lines += ["", "## Failed reconciliation (would be blocked before any write)", ""]
+            for s in broke:
+                lines += [f"- **`{s['name']}`**: {'; '.join(s['reconcile_errors'])}"]
         lines += [
             "",
-            "**YMYL safe** = introduced no regulated efficacy language and did not strip every "
-            "hedge off a claim. **Review** = introduced softer benefit wording that may or may "
-            "not be a fair paraphrase — a human decides.",
+            "**YMYL safe** = introduced no regulated efficacy language (`treats`, `cures`, "
+            "`clinically proven`, `FDA`) that the page does not already make. **Review** = "
+            "introduced softer benefit wording, or stripped every hedge off a claim — either "
+            "may be a fair paraphrase or an unearned claim, so a human decides.",
             "", "## YMYL probe findings", "",
         ]
         any_v = False
@@ -314,16 +353,20 @@ def render(task: str, summaries: list[dict]) -> str:
                   ""]
     else:
         lines += [
-            "| Model | Billing | Schema | Repairs | Produced | Grounded | Cites metric | "
-            "Rationale | Median | Tokens |",
+            "| Model | Billing | JSON | Repair | Produced | Grounded | Cites metric | "
+            "Rationale | Latency | Tokens |",
             "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for s in summaries:
+            if not s["schema_ok"]:
+                lines.append(f"| `{s['name']}` | {s['billing']} | **fail** | — | — | — | — | — | "
+                             f"{s['latency_s']}s | 0 |")
+                continue
             lines.append(
-                f"| `{s['name']}` | {s['billing']} | {_pct(s['schema_ok_rate'])} | "
-                f"{_pct(s['repair_rate'])} | {_pct(s['rates']['produced_any'])} | "
-                f"{_pct(s['rates']['all_grounded'])} | {_pct(s['rates']['all_cite_metric'])} | "
-                f"{_pct(s['rates']['all_have_rationale'])} | {s['median_latency_s']}s | "
+                f"| `{s['name']}` | {s['billing']} | ok | {_yn(s['repaired'])} | "
+                f"{_yn(s['rates']['produced_any'])} | {_yn(s['rates']['all_grounded'])} | "
+                f"{_yn(s['rates']['all_cite_metric'])} | "
+                f"{_yn(s['rates']['all_have_rationale'])} | {s['latency_s']}s | "
                 f"{s['tokens']:,} |")
         lines += ["", "## Hallucinated URLs / queries", ""]
         found = False
