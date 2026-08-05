@@ -40,6 +40,11 @@ schema_expectations:
 
 reporting:
   reports_dir: "reports"
-  discord: true          # posts summary via DISCORD_WEBHOOK_URL (webhook, not bot)
+  discord: true                 # master on/off for the Discord digest (webhook, not bot)
+  discord_channel: "#signalsanctuary"   # human reference only; not used by code
+  # Webhook URLs are secret -> they live in .env, NEVER here. Optionally name the env var
+  # holding this site's webhook. If unset, render_report falls back to the convention
+  # DISCORD_WEBHOOK_URL_SIGNALSANCTUARY, then the global DISCORD_WEBHOOK_URL.
+  # discord_webhook_env: "DISCORD_WEBHOOK_URL_SIGNALSANCTUARY"
 
 # Endpoints/secrets are NOT here — they live in .env (public-safe repo).

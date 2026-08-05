@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import re
 import sys
 from pathlib import Path
 
@@ -148,6 +149,30 @@ def discord_summary(cfg: dict, pages: list[dict], weekly: dict | None) -> str:
     return "\n".join(lines)
 
 
+def webhook_env_name(slug: str) -> str:
+    """Conventional per-site env var, e.g. signalsanctuary -> DISCORD_WEBHOOK_URL_SIGNALSANCTUARY."""
+    return "DISCORD_WEBHOOK_URL_" + re.sub(r"[^A-Z0-9]", "_", slug.upper())
+
+
+def resolve_webhook(cfg: dict, slug: str) -> tuple[str | None, str]:
+    """Find this site's webhook URL. URLs are secret-ish, so they live in .env — never in the
+    committed yaml, which only names *which* env var to read. Returns (url, source) where source
+    names where it came from (handy for logs). Resolution order:
+      1. env var named by reporting.discord_webhook_env in the config
+      2. convention:  DISCORD_WEBHOOK_URL_<SLUG>
+      3. global:      DISCORD_WEBHOOK_URL   (single-site / back-compat)
+    """
+    named = (cfg.get("reporting", {}) or {}).get("discord_webhook_env")
+    if named and env(named):
+        return env(named), named
+    conv = webhook_env_name(slug)
+    if env(conv):
+        return env(conv), conv
+    if env("DISCORD_WEBHOOK_URL"):
+        return env("DISCORD_WEBHOOK_URL"), "DISCORD_WEBHOOK_URL"
+    return None, ""
+
+
 def post_discord(webhook: str, content: str) -> None:
     r = requests.post(webhook, json={"content": content}, timeout=TIMEOUT)
     r.raise_for_status()
@@ -180,14 +205,15 @@ def main(argv: list[str] | None = None) -> int:
     out.write_text(md)
     print(f"[render_report] wrote {out}", file=sys.stderr)
 
-    webhook = env("DISCORD_WEBHOOK_URL")
+    webhook, source = resolve_webhook(cfg, slug)
     if args.no_discord or not cfg.get("reporting", {}).get("discord"):
         print("[render_report] Discord disabled by flag/config.", file=sys.stderr)
     elif not webhook:
-        print("[render_report] DISCORD_WEBHOOK_URL not set — skipping Discord post.", file=sys.stderr)
+        print(f"[render_report] no webhook set (tried {webhook_env_name(slug)} then "
+              f"DISCORD_WEBHOOK_URL) — skipping Discord post.", file=sys.stderr)
     else:
         post_discord(webhook, discord_summary(cfg, pages, weekly))
-        print("[render_report] posted Discord summary.", file=sys.stderr)
+        print(f"[render_report] posted Discord summary (via {source}).", file=sys.stderr)
     return 0
 
 
