@@ -37,7 +37,7 @@ because all secrets + site config live outside it. Values:
 
 ```
 ANTHROPIC_API_KEY=
-GSC_SERVICE_ACCOUNT_JSON=/run/secrets/gsc_sa.json   # path mounted into container, not committed
+GSC_SERVICE_ACCOUNT_JSON=secrets/gsc_sa.json        # relative to repo root (/app in container), not committed
 GSC_PROPERTY=sc-domain:signalsanctuary.health
 PSI_API_KEY=                                         # PageSpeed Insights
 DATABASE_URL=postgresql://…neon.tech/neondb?sslmode=require   # Neon Postgres — the state store

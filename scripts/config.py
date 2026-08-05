@@ -29,7 +29,16 @@ def _load_dotenv() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip())
+        os.environ.setdefault(key.strip(), _unquote(val.strip()))
+
+
+def _unquote(val: str) -> str:
+    """Strip one pair of surrounding matching quotes. Values are otherwise literal — no
+    shell/variable expansion — so tokens containing $, (), or # survive intact. Quote such
+    values in .env (single quotes preferred) so Docker Compose doesn't interpolate the $."""
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        return val[1:-1]
+    return val
 
 
 _load_dotenv()
@@ -50,6 +59,14 @@ def load_site_config(path: str | None = None) -> dict:
         p = REPO_ROOT / p
     with open(p) as f:
         return yaml.safe_load(f)
+
+
+def resolve_path(p: str) -> Path:
+    """Absolute paths pass through; relative paths resolve against the repo root — which is
+    /app in the container — so one .env value (e.g. secrets/gsc_sa.json) works both in local
+    dev and in the container."""
+    path = Path(p)
+    return path if path.is_absolute() else (REPO_ROOT / path)
 
 
 def site_slug(cfg: dict) -> str:

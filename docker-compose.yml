@@ -17,7 +17,7 @@ services:
       - ./reports:/app/reports          # committed md history (dashboard-lite)
       - ./logs:/app/logs
       - ./config:/app/config:ro
-      - ./secrets/gsc_sa.json:/run/secrets/gsc_sa.json:ro   # GSC service account, gitignored
+      - ./secrets/gsc_sa.json:/app/secrets/gsc_sa.json:ro   # GSC service account, gitignored (matches GSC_SERVICE_ACCOUNT_JSON=secrets/gsc_sa.json)
     # no `command:` here — provided per-invocation by systemd, e.g.:
     #   docker compose run --rm loop-runner python -m scripts.run_loop_b
     restart: "no"

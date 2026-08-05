@@ -28,7 +28,7 @@ from googleapiclient.discovery import build
 
 from . import db
 from .audit import resolve_targets
-from .config import env, load_site_config, site_slug
+from .config import env, load_site_config, resolve_path, site_slug
 
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 CRUX_ENDPOINT = "https://chromeuxreport.googleapis.com/v1/records:queryRecord"
@@ -44,8 +44,13 @@ CWV_THRESHOLDS = {
 # --- auth / service ---------------------------------------------------------
 
 def get_service():
-    sa_path = env("GSC_SERVICE_ACCOUNT_JSON", required=True)
-    creds = service_account.Credentials.from_service_account_file(sa_path, scopes=SCOPES)
+    sa_path = resolve_path(env("GSC_SERVICE_ACCOUNT_JSON", required=True))
+    if not sa_path.exists():
+        raise FileNotFoundError(
+            f"GSC service-account JSON not found at {sa_path}. Put it at secrets/gsc_sa.json "
+            f"(gitignored) or set GSC_SERVICE_ACCOUNT_JSON to an absolute path."
+        )
+    creds = service_account.Credentials.from_service_account_file(str(sa_path), scopes=SCOPES)
     return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
 
 
