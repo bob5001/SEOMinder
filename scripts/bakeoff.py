@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 import time
 from datetime import date
@@ -39,13 +40,19 @@ from pathlib import Path
 
 from . import agent, fixtures as fx
 from .config import REPO_ROOT, load_site_config
-from .models import Generation, candidates_for, generate_json
+from .models import Generation, candidates_for, preflight
 
 TASKS = ("loop_a_meta", "loop_b_rank")
 
 
 def _ref_name(ref: dict) -> str:
     return f"{ref['provider']}:{ref['model']}"
+
+
+def _norm(s: str) -> str:
+    """Whitespace- and case-insensitive form, so a quote isn't judged wrong over a stray
+    newline the HTML extractor introduced."""
+    return " ".join((s or "").split()).lower()
 
 
 def _billing(provider: str) -> str:
@@ -68,6 +75,17 @@ def score_loop_a(payload: dict, page: dict, cfg: dict) -> dict:
     changes = {c["field"]: c["new"] for c in payload.get("changes", [])}
     title, desc = changes.get("yoast_title"), changes.get("yoast_metadesc")
     checks: dict[str, bool | None] = {}
+
+    # Grounding: every source_quote must be a verbatim span of the page's own excerpt. This is
+    # a far stronger YMYL signal than any keyword list — a model that cannot point at the text
+    # it is paraphrasing is not preserving a claim, it is composing one.
+    haystack = _norm(f"{page.get('title') or ''} {page.get('metadesc') or ''} "
+                     f"{page.get('content_excerpt') or ''}")
+    quotes = [c.get("source_quote", "") for c in payload.get("changes", [])]
+    real = [q for q in quotes if q.strip()]
+    checks["quoted_source"] = bool(real) if quotes else None
+    checks["quotes_verbatim"] = (
+        all(_norm(q) in haystack for q in real) if real else None)
 
     # The site had NO Yoast metadata at all, so every page needs both fields written.
     checks["proposed_title"] = title is not None
@@ -153,7 +171,7 @@ def score_loop_b(payload: dict, weekly: dict) -> dict:
 # --- runner -----------------------------------------------------------------
 
 def run_task(task: str, cands: list[dict], cfg: dict, limit: int | None,
-             fixtures_dir: Path) -> list[dict]:
+             fixtures_dir: Path, repeat: int = 1) -> list[dict]:
     if task == "loop_a_meta":
         items = json.loads((fixtures_dir / "loop_a_pages.json").read_text())
         if limit:
@@ -165,56 +183,144 @@ def run_task(task: str, cands: list[dict], cfg: dict, limit: int | None,
     results: list[dict] = []
     for cand in cands:
         name = _ref_name(cand)
-        started = time.monotonic()
-        # ONE call per candidate — matching production. Loop A is a single batch over the
-        # whole in-scope set (uniqueness is a set property); Loop B is one weekly run.
-        print(f"\n=== {name} · {task} · 1 call over {len(items)} page(s) ===", file=sys.stderr)
-        record: dict = {}
-        try:
-            # Call the PRODUCTION entry points, not a parallel copy of them. Anything the
-            # bake-off measures — prompt, schema, token budget — is then by construction
-            # what Loop A and Loop B will actually send.
-            gen: Generation = (agent.propose_loop_a(items, cfg, model_ref=cand)
-                               if task == "loop_a_meta"
-                               else agent.propose_loop_b(items[0], cfg, model_ref=cand))
-            record.update(schema_ok=True, repaired=gen.repaired, latency_s=gen.latency_s,
-                          usage=gen.usage, payload=gen.data, raw=gen.raw_text[:8000])
+        # Separate "this runtime is broken" from "this model is weak" before scoring anything.
+        ok, detail = preflight(cand)
+        print(f"\n=== {name} · {task} · {repeat}x call over {len(items)} page(s) ===\n"
+              f"  preflight: {'ok' if ok else 'FAILED'} ({detail})", file=sys.stderr)
+        if not ok:
+            results.append({"candidate": cand, "name": name, "task": task,
+                            "n_items": len(items), "preflight": detail, "calls": []})
+            continue
 
-            if task == "loop_a_meta":
-                # Reconciliation is production's gate too — a batch that loses a page or
-                # returns duplicate metadata never reaches the write path.
-                check = agent.reconcile(gen.data, items)
-                record["reconcile"] = {"ok": check["ok"], "errors": check["errors"]}
-                record["pages"] = [
-                    ({"case": item["url"], "missing": True}
-                     if check["by_url"].get(item["url"]) is None else
-                     {"case": item["url"], "missing": False,
-                      **score_loop_a(check["by_url"][item["url"]], item, cfg)})
-                    for item in items
-                ]
-                got = sum(1 for p in record["pages"] if not p["missing"])
-                note = "" if check["ok"] else f"  ⚠ {'; '.join(check['errors'])[:160]}"
-                print(f"  {'~' if gen.repaired else 'ok'} {gen.latency_s}s  "
-                      f"{got}/{len(items)} pages{note}", file=sys.stderr)
-            else:
-                record["score"] = score_loop_b(gen.data, items[0])
-                print(f"  {'~' if gen.repaired else 'ok'} {gen.latency_s}s  "
-                      f"{record['score']['n_opportunities']} opportunities", file=sys.stderr)
-        except Exception as err:
-            # A model that cannot produce valid JSON after the repair round is a real
-            # result, not a crash — record it and keep the sweep going.
-            record.update(schema_ok=False, repaired=None,
-                          latency_s=round(time.monotonic() - started, 3),
-                          error=f"{type(err).__name__}: {err}"[:400])
-            print(f"  FAIL: {record['error'][:160]}", file=sys.stderr)
+        calls: list[dict] = []
+        for attempt in range(1, repeat + 1):
+            calls.append(_one_call(task, cand, items, cfg, attempt, repeat))
         results.append({"candidate": cand, "name": name, "task": task,
-                        "n_items": len(items), "call": record})
+                        "n_items": len(items), "preflight": detail, "calls": calls})
     return results
+
+
+def _one_call(task: str, cand: dict, items: list[dict], cfg: dict,
+              attempt: int, repeat: int) -> dict:
+    """One production-shaped call. Loop A is a single batch over the whole in-scope set
+    (uniqueness is a set property); Loop B is one weekly run."""
+    started = time.monotonic()
+    record: dict = {"attempt": attempt}
+    tag = f"[{attempt}/{repeat}]"
+    try:
+        # Call the PRODUCTION entry points, not a parallel copy of them. Anything the
+        # bake-off measures — prompt, schema, token budget — is then by construction
+        # what Loop A and Loop B will actually send.
+        gen: Generation = (agent.propose_loop_a(items, cfg, model_ref=cand)
+                           if task == "loop_a_meta"
+                           else agent.propose_loop_b(items[0], cfg, model_ref=cand))
+        record.update(schema_ok=True, repaired=gen.repaired, latency_s=gen.latency_s,
+                      usage=gen.usage, payload=gen.data, raw=gen.raw_text[:8000])
+
+        if task == "loop_a_meta":
+            # Reconciliation is production's gate too — a batch that loses a page or
+            # returns duplicate metadata never reaches the write path.
+            check = agent.reconcile(gen.data, items)
+            record["reconcile"] = {"ok": check["ok"], "errors": check["errors"]}
+            record["pages"] = [
+                ({"case": item["url"], "missing": True}
+                 if check["by_url"].get(item["url"]) is None else
+                 {"case": item["url"], "missing": False,
+                  **score_loop_a(check["by_url"][item["url"]], item, cfg)})
+                for item in items
+            ]
+            # First-pass band rate is the discriminating signal, so it is measured before any
+            # correction. The retry is what production ships, so it is measured separately.
+            record["misses_first_pass"] = len(agent.out_of_band(gen.data, cfg))
+            got = sum(1 for p in record["pages"] if not p["missing"])
+            note = "" if check["ok"] else f"  ⚠ {'; '.join(check['errors'])[:140]}"
+            print(f"  {tag} {'~' if gen.repaired else 'ok'} {gen.latency_s}s  "
+                  f"{got}/{len(items)} pages, {record['misses_first_pass']} off-band{note}",
+                  file=sys.stderr)
+        else:
+            record["score"] = score_loop_b(gen.data, items[0])
+            print(f"  {tag} {'~' if gen.repaired else 'ok'} {gen.latency_s}s  "
+                  f"{record['score']['n_opportunities']} opportunities", file=sys.stderr)
+    except Exception as err:
+        # A model that cannot produce valid JSON after the repair round is a real
+        # result, not a crash — record it and keep the sweep going.
+        record.update(schema_ok=False, repaired=None,
+                      latency_s=round(time.monotonic() - started, 3),
+                      error=f"{type(err).__name__}: {err}"[:400])
+        print(f"  {tag} FAIL: {record['error'][:160]}", file=sys.stderr)
+    return record
 
 
 # --- aggregate + report -----------------------------------------------------
 
 def summarize(entry: dict) -> dict:
+    """Roll per-call summaries into one row, keeping the spread visible.
+
+    Repeats matter here: at any temperature above zero, distinctness and band-compliance vary
+    run to run, and a single sample can crown the wrong model. Medians decide; min/max is
+    reported so a model that is merely lucky is legible as such.
+    """
+    if not entry.get("calls"):
+        return {"name": entry["name"], "provider": entry["candidate"]["provider"],
+                "n_items": entry["n_items"], "billing": _billing(entry["candidate"]["provider"]),
+                "preflight_failed": entry.get("preflight"), "schema_ok": False,
+                "runs": 0, "rates": {}, "ymyl_findings": [], "reconcile_errors": []}
+
+    per = [_summarize_call(c, entry["task"], entry["n_items"]) for c in entry["calls"]]
+    ok = [p for p in per if p["schema_ok"]]
+    base = ok[-1] if ok else per[-1]          # representative run for the detail sections
+
+    def agg(key: str) -> float | None:
+        vals = [p[key] for p in ok if p.get(key) is not None]
+        return statistics.median(vals) if vals else None
+
+    def agg_rate(key: str) -> float | None:
+        vals = [p["rates"].get(key) for p in ok]
+        vals = [v for v in vals if v is not None]
+        return statistics.median(vals) if vals else None
+
+    rolled = dict(base)
+    rolled.update({
+        # Identity comes from the entry — the per-call summaries are built with a stub
+        # candidate and would otherwise blank the name and mislabel who pays.
+        "name": entry["name"],
+        "provider": entry["candidate"]["provider"],
+        "billing": _billing(entry["candidate"]["provider"]),
+        "n_items": entry["n_items"],
+        "runs": len(per),
+        "runs_ok": len(ok),
+        "schema_ok": bool(ok),
+        "schema_ok_rate": len(ok) / len(per),
+        "latency_s": round(agg("latency_s") or 0, 1),
+        "tokens": int(agg("tokens") or 0),
+        "rates": {k: agg_rate(k) for k in base["rates"]},
+        "preflight_failed": None,
+    })
+    for key in ("ymyl_clean_rate", "ymyl_review_rate", "coverage"):
+        if key in base:
+            rolled[key] = agg(key)
+    if entry["task"] == "loop_a_meta":
+        uniq = [p["titles_unique"] and p["descs_unique"] for p in ok]
+        rolled["unique_all_runs"] = all(uniq) if uniq else None
+        rolled["unique_any_run"] = any(uniq) if uniq else None
+        misses = [p.get("misses_first_pass") for p in ok if p.get("misses_first_pass") is not None]
+        rolled["misses_median"] = statistics.median(misses) if misses else None
+        rolled["misses_range"] = (min(misses), max(misses)) if misses else None
+        # Every finding across every run — variance is the point of repeating.
+        rolled["ymyl_findings"] = [f for p in ok for f in p["ymyl_findings"]]
+        rolled["reconcile_errors"] = [e for p in ok for e in p.get("reconcile_errors", [])]
+    else:
+        rolled["hallucinated"] = [h for p in ok for h in p.get("hallucinated", [])]
+    return rolled
+
+
+def _summarize_call(call: dict, task: str, n_items: int) -> dict:
+    entry = {"task": task, "n_items": n_items, "call": call,
+             "candidate": {"provider": ""}, "name": ""}
+    return _summarize_one(entry)
+
+
+def _summarize_one(entry: dict) -> dict:
     call = entry["call"]
     usage = call.get("usage") or {}
     summary = {
@@ -243,8 +349,10 @@ def summarize(entry: dict) -> dict:
             return (sum(vals) / len(vals)) if vals else None
 
         for k in ("proposed_title", "proposed_desc", "title_in_band", "desc_in_band",
-                  "brand_kept", "tier1_only", "url_echoed"):
+                  "brand_kept", "tier1_only", "url_echoed",
+                  "quoted_source", "quotes_verbatim"):
             summary["rates"][k] = rate(k)
+        summary["misses_first_pass"] = call.get("misses_first_pass")
 
         # Uniqueness is the whole reason this is one call. Now it is a genuine pass/fail:
         # the model saw every page at once and had no excuse to repeat itself.
@@ -288,34 +396,51 @@ def _yn(v: bool | None) -> str:
 
 def render(task: str, summaries: list[dict]) -> str:
     n = summaries[0]["n_items"] if summaries else 0
+    runs = max((s.get("runs") or 0) for s in summaries) if summaries else 0
     lines = [f"# Model bake-off — `{task}`",
-             f"_{date.today().isoformat()} · one call per candidate over {n} identical frozen "
-             f"page(s)_", ""]
+             f"_{date.today().isoformat()} · {runs} run(s) per candidate, one call each over "
+             f"{n} identical frozen page(s) · medians shown_", ""]
 
     if task == "loop_a_meta":
         lines += [
-            "| Model | Billing | JSON | Repair | Coverage | Title band | Desc band | Brand | "
-            "Unique | **YMYL safe** | Review | Latency | Tokens |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+            "| Model | Billing | JSON ok | Coverage | Title band | Desc band | Off-band | "
+            "Brand | Unique | **Quotes verbatim** | **YMYL safe** | Review | Latency | Tokens |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for s in summaries:
-            if not s["schema_ok"]:
-                lines.append(
-                    f"| `{s['name']}` | {s['billing']} | **fail** | — | — | — | — | — | — | — | "
-                    f"— | {s['latency_s']}s | 0 |")
+            if s.get("preflight_failed"):
+                lines.append(f"| `{s['name']}` | {s['billing']} | **preflight fail** | — | — | "
+                             f"— | — | — | — | — | — | — | — | — |")
                 continue
-            uniq = _yn(s["titles_unique"] and s["descs_unique"])
+            if not s["schema_ok"]:
+                lines.append(f"| `{s['name']}` | {s['billing']} | **0/{s['runs']}** | — | — | "
+                             f"— | — | — | — | — | — | — | {s['latency_s']}s | 0 |")
+                continue
+            # Uniqueness across *every* run, not the lucky one.
+            uniq = _yn(s["unique_all_runs"])
+            if s["unique_any_run"] and not s["unique_all_runs"]:
+                uniq = "*flaky*"
+            lo, hi = s.get("misses_range") or (None, None)
+            off = "—" if s["misses_median"] is None else (
+                f"{s['misses_median']:.0f}" + (f" ({lo}–{hi})" if lo != hi else ""))
             lines.append(
-                f"| `{s['name']}` | {s['billing']} | ok | {_yn(s['repaired'])} | "
+                f"| `{s['name']}` | {s['billing']} | {s['runs_ok']}/{s['runs']} | "
                 f"{_pct(s['coverage'])} | {_pct(s['rates']['title_in_band'])} | "
-                f"{_pct(s['rates']['desc_in_band'])} | {_pct(s['rates']['brand_kept'])} | {uniq} | "
+                f"{_pct(s['rates']['desc_in_band'])} | {off} | "
+                f"{_pct(s['rates']['brand_kept'])} | {uniq} | "
+                f"**{_pct(s['rates']['quotes_verbatim'])}** | "
                 f"**{_pct(s['ymyl_clean_rate'])}** | {_pct(s['ymyl_review_rate'])} | "
                 f"{s['latency_s']}s | {s['tokens']:,} |")
 
-        failed = [s for s in summaries if not s["schema_ok"]]
+        pref = [s for s in summaries if s.get("preflight_failed")]
+        if pref:
+            lines += ["", "## Preflight failed — runtime, not model quality", ""]
+            lines += [f"- **`{s['name']}`**: `{s['preflight_failed']}`" for s in pref]
+
+        failed = [s for s in summaries if not s.get("preflight_failed") and not s["schema_ok"]]
         if failed:
             lines += ["", "## Could not return valid JSON", ""]
-            lines += [f"- **`{s['name']}`**: `{s['error']}`" for s in failed]
+            lines += [f"- **`{s['name']}`**: `{s.get('error')}`" for s in failed]
 
         broke = [s for s in summaries if s["schema_ok"] and s["reconciled"] is False]
         if broke:
@@ -324,10 +449,15 @@ def render(task: str, summaries: list[dict]) -> str:
                 lines += [f"- **`{s['name']}`**: {'; '.join(s['reconcile_errors'])}"]
         lines += [
             "",
+            "**Quotes verbatim** = every `source_quote` the model supplied is a literal span of "
+            "that page's own text. A model that cannot point at what it is paraphrasing is "
+            "composing a claim, not preserving one — this is the strongest YMYL signal here. "
             "**YMYL safe** = introduced no regulated efficacy language (`treats`, `cures`, "
-            "`clinically proven`, `FDA`) that the page does not already make. **Review** = "
+            "`clinically proven`, `FDA`) the page does not already make. **Review** = "
             "introduced softer benefit wording, or stripped every hedge off a claim — either "
-            "may be a fair paraphrase or an unearned claim, so a human decides.",
+            "may be a fair paraphrase or an unearned claim, so a human decides. "
+            "**Off-band** = titles/descriptions outside their character band on the FIRST pass, "
+            "before `refine_lengths` retries them; median, with range across runs.",
             "", "## YMYL probe findings", "",
         ]
         any_v = False
@@ -353,21 +483,31 @@ def render(task: str, summaries: list[dict]) -> str:
                   ""]
     else:
         lines += [
-            "| Model | Billing | JSON | Repair | Produced | Grounded | Cites metric | "
+            "| Model | Billing | JSON ok | Repair | Produced | Grounded | Cites metric | "
             "Rationale | Latency | Tokens |",
             "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for s in summaries:
+            if s.get("preflight_failed"):
+                lines.append(f"| `{s['name']}` | {s['billing']} | **preflight fail** | — | — | "
+                             f"— | — | — | — | — |")
+                continue
             if not s["schema_ok"]:
-                lines.append(f"| `{s['name']}` | {s['billing']} | **fail** | — | — | — | — | — | "
-                             f"{s['latency_s']}s | 0 |")
+                lines.append(f"| `{s['name']}` | {s['billing']} | **0/{s['runs']}** | — | — | "
+                             f"— | — | — | {s['latency_s']}s | 0 |")
                 continue
             lines.append(
-                f"| `{s['name']}` | {s['billing']} | ok | {_yn(s['repaired'])} | "
-                f"{_yn(s['rates']['produced_any'])} | {_yn(s['rates']['all_grounded'])} | "
-                f"{_yn(s['rates']['all_cite_metric'])} | "
-                f"{_yn(s['rates']['all_have_rationale'])} | {s['latency_s']}s | "
+                f"| `{s['name']}` | {s['billing']} | {s['runs_ok']}/{s['runs']} | "
+                f"{_yn(s['repaired'])} | "
+                f"{_pct(s['rates']['produced_any'])} | {_pct(s['rates']['all_grounded'])} | "
+                f"{_pct(s['rates']['all_cite_metric'])} | "
+                f"{_pct(s['rates']['all_have_rationale'])} | {s['latency_s']}s | "
                 f"{s['tokens']:,} |")
+
+        pref = [s for s in summaries if s.get("preflight_failed")]
+        if pref:
+            lines += ["", "## Preflight failed — runtime, not model quality", ""]
+            lines += [f"- **`{s['name']}`**: `{s['preflight_failed']}`" for s in pref]
         lines += ["", "## Hallucinated URLs / queries", ""]
         found = False
         for s in summaries:
@@ -385,6 +525,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--task", choices=TASKS, required=True)
     ap.add_argument("--site", help="Site config for thresholds (default from SITE_CONFIG).")
     ap.add_argument("--limit", type=int, help="Score only the first N fixtures (YMYL probes first).")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="Runs per candidate (default 1). Use 3-5 to see run-to-run variance; "
+                         "medians decide, min-max is reported.")
     ap.add_argument("--candidate", action="append",
                     help="Override candidates, 'provider:model'. Repeatable.")
     ap.add_argument("--fixtures", default="fixtures")
@@ -406,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
     if not cands:
         raise SystemExit(f"No bake-off candidates configured for '{args.task}' in config/models.yaml.")
 
-    results = run_task(args.task, cands, cfg, args.limit, fixtures_dir)
+    results = run_task(args.task, cands, cfg, args.limit, fixtures_dir, repeat=args.repeat)
     summaries = [summarize(r) for r in results]
 
     out = Path(args.out) if args.out else (

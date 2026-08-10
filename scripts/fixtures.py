@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -96,10 +98,21 @@ def _text_of(html: str) -> str:
     return " ".join(parts)[:EXCERPT_CHARS]
 
 
-def terms_present(text: str, vocabulary: list[str]) -> list[str]:
-    """Which vocabulary terms appear in `text` (lowercased substring match)."""
+@lru_cache(maxsize=None)
+def _term_re(term: str) -> re.Pattern:
+    return re.compile(r"\b" + re.escape(term) + r"\b")
+
+
+def terms_present(text: str, vocabulary: tuple[str, ...] | list[str]) -> list[str]:
+    """Which vocabulary terms appear in `text`, matched on WORD BOUNDARIES.
+
+    Substring matching is wrong here and quietly poisons the YMYL column: `heal` is inside
+    `health`, `cure` inside `secure`, `treat` inside `retreat`. A model writing the ordinary
+    phrase "impacts on health" was being reported as introducing regulated efficacy language —
+    a false accusation in the one column that has to stay trustworthy.
+    """
     low = text.lower()
-    return sorted({t for t in vocabulary if t in low})
+    return sorted({t for t in vocabulary if _term_re(t).search(low)})
 
 
 def build_loop_a(site: str) -> list[dict]:

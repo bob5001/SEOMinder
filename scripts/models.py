@@ -93,10 +93,29 @@ def _provider(name: str) -> dict:
     return providers[name]
 
 
+def sampling_for(model: str) -> dict:
+    """Sampling parameters for a model, by longest matching prefix in config `sampling:`.
+
+    Model families are post-trained at different sampling settings, and using one family's
+    defaults on another is a common reason a model looks worse than its benchmarks. It bites
+    this project specifically: a model tuned for temperature 1.0 driven at 0 tends toward
+    degenerate repetition, which would show up in the bake-off as poor *distinctness* — the
+    single metric Loop A's one-call design exists to satisfy. Wrong sampling would make the
+    right model look wrong.
+    """
+    table = _cfg().get("sampling", {}) or {}
+    best = ""
+    for prefix in table:
+        if prefix != "default" and model.startswith(prefix) and len(prefix) > len(best):
+            best = prefix
+    return dict(table.get(best or "default", {}) or {})
+
+
 # --- public API -------------------------------------------------------------
 
 def generate_json(model_ref: dict, prompt: str, schema: dict, *,
-                  system: str | None = None, max_tokens: int = DEFAULT_MAX_TOKENS) -> Generation:
+                  system: str | None = None, max_tokens: int = DEFAULT_MAX_TOKENS,
+                  sampling: dict | None = None) -> Generation:
     """Ask `model_ref` for JSON matching `schema`; validate it (with one repair retry) and
     return a Generation. Raises if the model can't produce schema-valid JSON after the retry.
 
@@ -107,8 +126,11 @@ def generate_json(model_ref: dict, prompt: str, schema: dict, *,
     if complete is None:
         raise KeyError(f"No adapter for provider kind '{prov['kind']}'")
 
+    if sampling is None:
+        sampling = sampling_for(model_ref["model"])
+
     started = time.monotonic()
-    text, usage = complete(prov, model_ref["model"], system, prompt, schema, max_tokens)
+    text, usage = complete(prov, model_ref["model"], system, prompt, schema, max_tokens, sampling)
     repaired = False
     try:
         data = _validate(text, schema)
@@ -119,7 +141,8 @@ def generate_json(model_ref: dict, prompt: str, schema: dict, *,
             f"(error: {err}). Return ONLY a single JSON object matching the schema — no prose, "
             f"no code fences."
         )
-        text, usage2 = complete(prov, model_ref["model"], system, repair_prompt, schema, max_tokens)
+        text, usage2 = complete(prov, model_ref["model"], system, repair_prompt, schema,
+                                max_tokens, sampling)
         usage = {k: usage.get(k, 0) + usage2.get(k, 0) for k in set(usage) | set(usage2)}
         data = _validate(text, schema)  # raises if still invalid — caller/bake-off records the failure
 
@@ -128,6 +151,32 @@ def generate_json(model_ref: dict, prompt: str, schema: dict, *,
         latency_s=round(time.monotonic() - started, 3), usage=usage,
         repaired=repaired, raw_text=text,
     )
+
+
+PREFLIGHT_SCHEMA: dict = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "n"],
+    "properties": {"ok": {"type": "boolean"}, "n": {"type": "integer"}},
+}
+
+
+def preflight(model_ref: dict) -> tuple[bool, str]:
+    """Cheap check that a model+runtime can honour a JSON schema at all.
+
+    Worth its own step because of a known Ollama defect where a schema-constrained request
+    with thinking disabled returned HTTP 200 carrying plain prose — no error, no schema. Our
+    validate-then-repair path turns that into a loud exception rather than a silent bad write,
+    but without a probe the failure looks like the *model* is bad at JSON. This separates
+    "this runtime is broken" from "this model is weak", which are different decisions.
+    """
+    try:
+        gen = generate_json(model_ref, 'Return exactly {"ok": true, "n": 7} and nothing else.',
+                            PREFLIGHT_SCHEMA, max_tokens=200)
+    except Exception as err:
+        return False, f"{type(err).__name__}: {err}"[:200]
+    if gen.data.get("n") != 7:
+        return False, f"schema honoured but content wrong: {gen.data}"
+    return True, "repaired" if gen.repaired else "ok"
 
 
 def _validate(text: str, schema: dict) -> dict:
@@ -149,9 +198,13 @@ def _extract_json(text: str) -> str:
 
 
 # --- adapters (one per provider kind) --------------------------------------
-# Signature: (provider_cfg, model, system, prompt, schema, max_tokens) -> (text, usage)
+# Signature: (provider_cfg, model, system, prompt, schema, max_tokens, sampling) -> (text, usage)
+#
+# `sampling` is honoured only by the openai adapter. Current Claude models REJECT
+# temperature / top_p / top_k with a 400, and the Claude CLI exposes no sampling knobs at
+# all, so both Anthropic paths ignore it by design rather than by omission.
 
-def _complete_anthropic(prov, model, system, prompt, schema, max_tokens):
+def _complete_anthropic(prov, model, system, prompt, schema, max_tokens, sampling=None):
     import anthropic  # lazy: only needed if the anthropic provider is used
     client = anthropic.Anthropic(api_key=env(prov.get("api_key_env") or "ANTHROPIC_API_KEY", required=True))
     kwargs: dict[str, Any] = {
@@ -169,13 +222,23 @@ def _complete_anthropic(prov, model, system, prompt, schema, max_tokens):
     return text, usage
 
 
-def _complete_openai(prov, model, system, prompt, schema, max_tokens):
+def _complete_openai(prov, model, system, prompt, schema, max_tokens, sampling=None):
     import openai  # lazy: covers OpenAI *and* local Ollama/vLLM/LM Studio via base_url
     api_key = env(prov["api_key_env"]) if prov.get("api_key_env") else "local-no-key"
     client = openai.OpenAI(base_url=prov.get("base_url"), api_key=api_key or "local-no-key")
     messages = ([{"role": "system", "content": system}] if system else []) + \
                [{"role": "user", "content": prompt}]
-    common = {"model": model, "messages": messages, "temperature": 0, "max_tokens": max_tokens}
+
+    sampling = dict(sampling or {})
+    # top_k isn't an OpenAI parameter, and thinking toggles are per-family template kwargs —
+    # both ride through extra_body, which local runtimes read.
+    extra_body = dict(sampling.pop("extra_body", {}) or {})
+    if "top_k" in sampling:
+        extra_body["top_k"] = sampling.pop("top_k")
+    common = {"model": model, "messages": messages, "max_tokens": max_tokens, **sampling}
+    if extra_body:
+        common["extra_body"] = extra_body
+
     try:  # prefer strict json_schema (OpenAI, recent Ollama/vLLM)
         resp = client.chat.completions.create(
             response_format={"type": "json_schema",
@@ -190,7 +253,7 @@ def _complete_openai(prov, model, system, prompt, schema, max_tokens):
     return text, usage
 
 
-def _complete_claude_cli(prov, model, system, prompt, schema, max_tokens):
+def _complete_claude_cli(prov, model, system, prompt, schema, max_tokens, sampling=None):
     """Claude Code CLI (`claude -p`) — runs on the Pro/Max SUBSCRIPTION, not the API meter.
 
     Two things make this the production default:

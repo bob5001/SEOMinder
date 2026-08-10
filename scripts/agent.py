@@ -34,6 +34,8 @@ Bake-off interface (scripts.bakeoff scores; it calls these):
 """
 from __future__ import annotations
 
+import json
+
 from . import db
 from .models import Generation, generate_json, route_for
 
@@ -67,15 +69,28 @@ LOOP_A_PAGE_SCHEMA: dict = {
         "changes": {
             "type": "array",
             "items": {
+                # PROPERTY ORDER IS LOAD-BEARING. Constrained decoders emit fields in schema
+                # order, so anything placed after `new` is written *after* the model has
+                # already committed to the text — post-hoc justification, not reasoning.
+                # `source_quote` comes first so the model must point at the page's own words
+                # before it paraphrases them, and the orchestrator can then verify the quote
+                # is really in the page. That turns YMYL from a keyword heuristic into a
+                # grounding check.
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["field", "new", "tier"],
+                "required": ["field", "source_quote", "new", "tier"],
                 "properties": {
                     "field": {"type": "string", "enum": ["yoast_title", "yoast_metadesc"]},
+                    "source_quote": {
+                        "type": "string",
+                        "description": ("Verbatim span copied from this page's content excerpt "
+                                        "carrying the claim the new text must preserve. Empty "
+                                        "string only if the page makes no claim of any kind."),
+                    },
+                    "rationale": {"type": "string"},
                     "old": {"type": ["string", "null"]},
                     "new": {"type": "string"},
                     "tier": {"type": "integer", "enum": [1]},
-                    "rationale": {"type": "string"},
                 },
             },
         },
@@ -167,6 +182,12 @@ def loop_a_prompt(pages: list[dict], cfg: dict, taken: dict | None = None) -> st
         "2. For each page, if the title or meta description is outside its target band, missing, "
         "or weak, propose a Tier-1 replacement (field yoast_title / yoast_metadesc) that fits the "
         "band and reflects the page accurately. Do not touch health-claim substance.\n"
+        "   For every change, first fill `source_quote` with a span copied VERBATIM from that "
+        "page's content excerpt above — the words carrying the claim your new text has to "
+        "preserve. Copy it character for character; it is checked against the page. Then write "
+        "`new` so it says no more than the quote does: do not add an effect the page does not "
+        "state, and keep any hedge the page uses ('may', 'can help', 'some people report') "
+        "rather than asserting it flatly. Use an empty quote only if the page makes no claim.\n"
         "3. EVERY title must be distinct from every other title in your response, and every "
         "description distinct from every other description. Pages on similar topics must be "
         "differentiated by what is actually specific to each one, not by padding.\n"
@@ -195,6 +216,84 @@ def propose_loop_a(pages: list[dict], cfg: dict, taken: dict | None = None,
 
 
 # --- orchestrator-side validation (the agent proposes; db.py remains the only writer) ------
+
+def bands(cfg: dict) -> dict[str, tuple[int, int]]:
+    th = cfg.get("thresholds", {})
+    t, m = th.get("title_len", {}), th.get("metadesc_len", {})
+    return {"yoast_title": (t.get("min", 50), t.get("max", 60)),
+            "yoast_metadesc": (m.get("min", 150), m.get("max", 160))}
+
+
+def out_of_band(payload: dict, cfg: dict) -> list[dict]:
+    """Changes whose text misses its character band.
+
+    No model in this class counts characters reliably, and it is not worth prompt budget to
+    pretend otherwise — the rule is deterministic, so the orchestrator measures and the model
+    gets told the exact overage. Note this is a *business* rule: generate_json's repair round
+    only fixes JSON validity and would happily pass a 67-character title.
+    """
+    limits = bands(cfg)
+    misses: list[dict] = []
+    for page in payload.get("pages", []):
+        for change in page.get("changes", []):
+            lo, hi = limits.get(change.get("field"), (0, 10_000))
+            n = len(change.get("new", ""))
+            if not (lo <= n <= hi):
+                misses.append({"url": page.get("url"), "field": change["field"],
+                               "text": change["new"], "len": n, "min": lo, "max": hi})
+    return misses
+
+
+def refine_lengths(payload: dict, pages: list[dict], cfg: dict, model_ref: dict | None = None,
+                   max_rounds: int = 2) -> tuple[dict, list[dict]]:
+    """Re-ask only the pages that missed a band, feeding back the measured overage.
+
+    Re-running the whole batch to fix two long titles wastes the expensive path and risks
+    perturbing text that was already correct. So each round re-asks just the offending pages —
+    and passes every accepted title/description as `taken`, which is exactly what that
+    parameter is for: a partial re-ask that still cannot collide with what we are keeping.
+
+    Returns (merged_payload, remaining_misses).
+    """
+    merged = json.loads(json.dumps(payload))          # don't mutate the caller's payload
+    by_url = {p.get("url"): p for p in merged.get("pages", [])}
+    by_url_src = {p["url"]: p for p in pages}
+
+    for _ in range(max_rounds):
+        misses = out_of_band(merged, cfg)
+        if not misses:
+            break
+        bad_urls = sorted({m["url"] for m in misses})
+        retry_pages = [by_url_src[u] for u in bad_urls if u in by_url_src]
+        if not retry_pages:
+            break
+
+        # Everything we are keeping is off-limits for the retry.
+        taken = {"titles": [], "descs": []}
+        for url, page in by_url.items():
+            if url in bad_urls:
+                continue
+            for change in page.get("changes", []):
+                key = "titles" if change["field"] == "yoast_title" else "descs"
+                taken[key].append(change["new"])
+
+        detail = "\n".join(
+            f"- {m['url']} {m['field']}: {m['len']} chars, must be {m['min']}-{m['max']} "
+            f"({'shorten by ' + str(m['len'] - m['max']) if m['len'] > m['max'] else 'lengthen by ' + str(m['min'] - m['len'])}) "
+            f"— was: {m['text']!r}"
+            for m in misses)
+        prompt = (loop_a_prompt(retry_pages, cfg, taken) +
+                  "\n\nA previous attempt missed the character bands. Fix exactly these, keeping "
+                  "the meaning and the source_quote grounding:\n" + detail)
+
+        gen = generate_json(model_ref or route_for("loop_a_meta"), prompt, LOOP_A_BATCH_SCHEMA,
+                            system=LOOP_A_SYSTEM, max_tokens=loop_a_max_tokens(len(retry_pages)))
+        for page in gen.data.get("pages", []):
+            if page.get("url") in by_url:
+                by_url[page["url"]] = page
+        merged["pages"] = list(by_url.values())
+
+    return merged, out_of_band(merged, cfg)
 
 def collisions(payload: dict) -> dict[str, list[str]]:
     """Duplicate titles/descriptions the model returned despite being asked for distinct ones.
@@ -291,7 +390,6 @@ LOOP_B_RUN_SCHEMA: dict = {
 
 def loop_b_prompt(weekly: dict, cfg: dict) -> str:
     """Assemble the Loop B prompt from a seo_weekly-shaped dict (per_url + cwv_field)."""
-    import json
     th = cfg.get("thresholds", {})
     sd = th.get("striking_distance", {})
     return (

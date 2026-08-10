@@ -37,20 +37,54 @@ routing:
   loop_a_meta: { provider: claude_cli, model: claude-opus-5 }    # YMYL meta text -> capable
   loop_b_rank: { provider: claude_cli, model: claude-sonnet-5 }  # ranking + rationale
 
+# Sampling parameters, matched to a model by LONGEST PREFIX (scripts.models.sampling_for).
+# Families are post-trained at different settings and borrowing one family's defaults for
+# another is a standard reason a model underperforms its benchmarks. Driving a model tuned
+# for temperature 1.0 at 0 invites degenerate repetition, which would surface here as poor
+# title/description *distinctness* — the metric Loop A's one-call design exists to satisfy.
+#
+# Applies to the `openai` provider kind only. Current Claude models reject temperature /
+# top_p / top_k with a 400, and the CLI exposes no sampling knobs, so both Anthropic paths
+# ignore this block. `extra_body` carries anything outside the OpenAI schema (top_k is added
+# there automatically; per-family thinking toggles go there too).
+sampling:
+  default:
+    temperature: 0.7
+    top_p: 0.9
+  gemma4:
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 64
+  qwen3.6:
+    # Qwen3.6 dropped the /think soft switch; thinking is disabled via template kwargs.
+    # These are its NON-thinking values — switch to temp 1.0 / top_p 0.95 / presence 0.0
+    # if you enable thinking (worth testing on loop_b_rank, which is pure analysis).
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    presence_penalty: 1.5
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  llama3.1:
+    temperature: 0.7
+    top_p: 0.9
+
 # Bake-off candidates to score per task (scripts.models.candidates_for(task)).
-# Local entries are models actually installed in this machine's Ollama; `ollama list`
-# before adding more. The subscription entries are the quality baseline to beat.
+# `-mlx` variants exist for the gemma4/qwen3.6 tags and are worth a second pass on Apple
+# Silicon; GGUF vs MLX footprints differ per model, so check both before deciding.
+# llama3.1:8b stays as a control — we already have baseline numbers for it.
 bakeoff:
   loop_a_meta:
     - { provider: claude_cli, model: claude-opus-5 }
     - { provider: claude_cli, model: claude-sonnet-5 }
-    - { provider: ollama,     model: "gpt-oss:20b" }
-    - { provider: ollama,     model: "deepseek-r1:14b" }
-    - { provider: ollama,     model: "qwen2.5-coder:latest" }
+    - { provider: ollama,     model: "gemma4:31b" }
+    - { provider: ollama,     model: "gemma4:26b" }
+    - { provider: ollama,     model: "qwen3.6:27b" }
     - { provider: ollama,     model: "llama3.1:8b" }
   loop_b_rank:
     - { provider: claude_cli, model: claude-sonnet-5 }
-    - { provider: ollama,     model: "gpt-oss:20b" }
-    - { provider: ollama,     model: "deepseek-r1:14b" }
-    - { provider: ollama,     model: "mixtral:latest" }
+    - { provider: ollama,     model: "qwen3.6:27b" }
+    - { provider: ollama,     model: "gemma4:26b" }
+    - { provider: ollama,     model: "gemma4:31b" }
     - { provider: ollama,     model: "llama3.1:8b" }
