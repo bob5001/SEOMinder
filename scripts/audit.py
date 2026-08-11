@@ -271,9 +271,13 @@ def _psi_get(params: dict) -> requests.Response:
     for attempt in range(PSI_RETRIES):
         try:
             r = requests.get(PSI_ENDPOINT, params=params, timeout=90)
-            if r.status_code < 500:
-                r.raise_for_status()
+            if r.status_code < 400:
                 return r
+            if r.status_code < 500 and r.status_code != 429:
+                # A 4xx is a verdict, not weather. Retrying a malformed request or a rejected
+                # key just burns three attempts and delays the real error.
+                raise RuntimeError(_scrub(f"PSI rejected the request: HTTP {r.status_code} "
+                                          f"{r.text[:200]}"))
             last = f"HTTP {r.status_code}"
         except requests.RequestException as err:
             last = _scrub(f"{type(err).__name__}: {err}")
