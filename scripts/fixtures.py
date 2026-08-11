@@ -34,7 +34,7 @@ from . import audit, db
 from .config import REPO_ROOT, load_site_config, site_slug
 
 FIXTURES_DIR = "fixtures"
-EXCERPT_CHARS = 1400
+
 
 # Introducing one of these is a HARD violation: regulated efficacy and medical-authority
 # language. A wellness product that "treats", "cures", or is "clinically proven" is making
@@ -82,20 +82,17 @@ HEDGE_TERMS = [
 ]
 
 
-def _text_of(html: str) -> str:
-    """Visible prose only — chrome carries no information about what the page claims."""
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "nav", "header", "footer", "noscript", "form"]):
-        tag.decompose()
-    root = soup.find("main") or soup.find("article") or soup.body or soup
-    parts: list[str] = []
-    for el in root.find_all(["h1", "h2", "h3", "p", "li"]):
-        t = " ".join(el.get_text(" ", strip=True).split())
-        if len(t) > 25:            # skip nav crumbs and one-word list items
-            parts.append(t)
-        if sum(len(p) for p in parts) > EXCERPT_CHARS:
-            break
-    return " ".join(parts)[:EXCERPT_CHARS]
+def _excerpt_for(row: dict) -> str:
+    """Prefer the excerpt audit.py already persisted; fetch only if it is missing.
+
+    Two reasons not to keep a second extractor here: the bake-off should score models on
+    exactly the text production will hand them, and two implementations of "what counts as
+    page prose" would drift apart silently.
+    """
+    if row.get("content_excerpt"):
+        return row["content_excerpt"]
+    resp = audit.fetch(row["url"])
+    return audit.extract_prose(BeautifulSoup(resp.text, "lxml"))
 
 
 @lru_cache(maxsize=None)
@@ -124,10 +121,9 @@ def build_loop_a(site: str) -> list[dict]:
     for row in rows:
         url = row["url"]
         try:
-            resp = audit.fetch(url)
-            excerpt = _text_of(resp.text)
+            excerpt = _excerpt_for(row)
         except Exception as err:                      # a dead page shouldn't kill the build
-            print(f"[fixtures] {url}: fetch failed ({err}) — excerpt omitted", file=sys.stderr)
+            print(f"[fixtures] {url}: no excerpt ({err})", file=sys.stderr)
             excerpt = ""
 
         # The claim surface the model is allowed to draw on: the page's own words.

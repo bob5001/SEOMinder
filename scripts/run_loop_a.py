@@ -11,7 +11,8 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import agent, audit, render_report
+from . import agent, audit, db, render_report
+from .config import load_site_config, site_slug
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -21,7 +22,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--runs", type=int, default=3, help="PSI runs to median (default 3).")
     ap.add_argument("--no-psi", action="store_true")
     ap.add_argument("--no-links", action="store_true")
-    ap.add_argument("--no-agent", action="store_true", help="Skip the claude -p fix/judgment step.")
+    ap.add_argument("--no-agent", action="store_true", help="Skip the metadata proposal step.")
+    ap.add_argument("--apply", action="store_true",
+                    help="Write accepted Tier-1 changes to WordPress. WITHOUT this the agent "
+                         "runs, state is recorded and a diff is printed, but the live site is "
+                         "untouched — the intended way to rehearse against production.")
     ap.add_argument("--no-render", action="store_true")
     ap.add_argument("--no-discord", action="store_true")
     args = ap.parse_args(argv)
@@ -41,17 +46,36 @@ def main(argv: list[str] | None = None) -> int:
     if rc != 0:
         return rc
 
-    # 2. agent — Tier-1 Yoast fixes + authoritative checklist_status (deferred).
+    # 2. agent — proposes Tier-1 Yoast metadata. checklist_status is NOT its job: audit.py
+    #    already computed it from measured fields via scripts.checklist.
     if args.no_agent:
         pass
     elif not agent.WIRED:
-        print("[loop_a] agent step not wired yet (deferred) — deterministic audit + render only. "
-              "checklist_status stays unset until the agent runs.", file=sys.stderr)
+        print("[loop_a] agent step not wired (agent.WIRED is False) — deterministic audit + "
+              "render only.", file=sys.stderr)
     elif not agent.agent_available():
-        print("[loop_a] agent unavailable (no ANTHROPIC_API_KEY / claude CLI) — skipping fix step.",
+        print("[loop_a] routed model unreachable (preflight failed) — skipping proposal step.",
               file=sys.stderr)
     else:
-        agent.run_loop_a_fixes  # wired path lives here
+        cfg = load_site_config(f"config/{args.site}.yaml" if args.site else None)
+        slug = site_slug(cfg)
+        pages = db.list_page_state(slug)
+        if args.url:
+            pages = [p for p in pages if p["url"] == args.url]
+        missing = [p["url"] for p in pages if not p.get("content_excerpt")]
+        if missing:
+            print(f"[loop_a] {len(missing)} page(s) have no content_excerpt — re-run audit "
+                  f"before proposing, or the model writes metadata blind.", file=sys.stderr)
+        try:
+            summary = agent.run_loop_a_fixes(cfg, slug, pages, apply=args.apply)
+            print(agent.render_proposals(summary, pages, cfg))
+        except NotImplementedError as err:
+            print(f"[loop_a] {err}", file=sys.stderr)
+            return 2
+        except RuntimeError as err:
+            # Reconciliation failure: nothing was written, by design.
+            print(f"[loop_a] proposal rejected, nothing written — {err}", file=sys.stderr)
+            return 1
 
     # 3. render — projection of Postgres -> reports/<date>.md (+ Discord).
     if not args.no_render:

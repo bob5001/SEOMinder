@@ -8,17 +8,24 @@ model, including local ones, can run these tasks, and why the bake-off is meanin
 The provider/model for each task comes from config/models.yaml via scripts.models. Nothing
 here is bound to a specific provider.
 
-Contract (unchanged):
+Contract:
   * The agent NEVER writes to Postgres. It returns JSON; the orchestrator persists via db.py.
+  * The agent does NOT judge the checklist either. `checklist_status` is measured fields versus
+    thresholds — arithmetic with a right answer — so scripts.checklist computes it and audit.py
+    persists it. The model proposes text; nothing safety-relevant depends on its judgement.
   * The only live CONTENT writes are Yoast meta via WP MCP on Loop A, Tier-gated: Tier 1
     auto-fix; Tier 2/3 detect + queue for a human. WP backs up daily (7 days) — rollback net.
-  * Out-of-band, non-content tasks (redirects, hosting/CWV, Tier-3) go to the CodeManager broker.
+  * Out-of-band, non-content work (redirects, hosting/CWV, Tier-3) is recorded in Postgres with
+    the rest of the state. CodeManager stays a project-level agent-knowledge layer; this tool
+    has to run without it.
 
-Two things are still to build before WIRED=True:
-  1. Loop A: the WP MCP write that applies the returned Tier-1 changes (and page content excerpt
-     plumbing — the meta writer needs the page's topic; see loop_a_prompt).
-  2. End-to-end validation of the model calls against at least one cloud + one local model.
-Loop B has no content write — `run_loop_b_ranking` below is fully implementable now.
+Two gates, deliberately separate (measure twice, cut once):
+  WIRED     the agent step runs at all.
+  --apply   proposals are actually written to WordPress. Off by default, so a wired run
+            proposes, persists state, and prints a diff without touching the live site.
+
+Still to build before --apply can do anything: the WP MCP write path. Loop B has no content
+write, so `run_loop_b_ranking` is fully implementable today.
 
 Loop A runs as ONE call over the whole in-scope set. Titles and descriptions have to be
 unique, and uniqueness is a property of the set — a model shown one page at a time cannot
@@ -36,11 +43,30 @@ from __future__ import annotations
 
 import json
 
-from . import db
-from .models import Generation, generate_json, route_for
+from . import checklist, db
+from .models import Generation, generate_json, preflight, route_for
 
-# Flip to True once the WP MCP write (Loop A) is built and the model calls are validated.
+# Gate 1: does the agent step run at all?
 WIRED = False
+
+
+def agent_available() -> bool:
+    """Whether the routed provider for the agent step can actually be reached.
+
+    Previously this checked for ANTHROPIC_API_KEY, which is now the wrong signal twice over:
+    production routes through the Claude CLI on the subscription (no API key), and local
+    models need no credential at all. It also silently disappeared in an earlier refactor
+    while both orchestrators kept calling it — masked only because `not WIRED` short-circuits
+    first, so flipping WIRED would have raised AttributeError on the first real run.
+    """
+    for task in ("loop_a_meta", "loop_b_rank"):
+        try:
+            ok, _ = preflight(route_for(task))
+        except Exception:
+            return False
+        if not ok:
+            return False
+    return True
 
 # The hard YMYL rule, injected into every content-generation prompt.
 YMYL_BOUNDARY = (
@@ -62,10 +88,12 @@ LOOP_A_SYSTEM = (
 LOOP_A_PAGE_SCHEMA: dict = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["url", "checklist_status", "changes", "manual_queue"],
+    # No checklist_status here on purpose: the verdict is computed by scripts.checklist from
+    # measured fields, not generated. Asking a model to judge it made a safety-relevant field
+    # vary between runs for no gain.
+    "required": ["url", "changes", "manual_queue"],
     "properties": {
         "url": {"type": "string"},
-        "checklist_status": {"type": "string", "enum": ["green", "queued", "failing"]},
         "changes": {
             "type": "array",
             "items": {
@@ -194,8 +222,8 @@ def loop_a_prompt(pages: list[dict], cfg: dict, taken: dict | None = None) -> st
         "4. Anything that needs body edits (alt text, headings, internal links) or a health-claim "
         "rewrite is NOT Tier 1 — put it in that page's manual_queue as tier 2 (structure) or "
         "tier 3 (claims).\n"
-        "5. Set each page's checklist_status: 'green' if no Tier-1 change is needed, else "
-        "'queued'; 'failing' only if something is broken you cannot address.\n"
+        "5. Do not judge whether a page passes overall — that is measured separately. Return "
+        "only what you would change and what you would queue.\n"
         "Return only the JSON object."
     )
 
@@ -413,22 +441,86 @@ def propose_loop_b(weekly: dict, cfg: dict, model_ref: dict | None = None) -> Ge
 
 # --- orchestrator entry points ---------------------------------------------
 
-def run_loop_a_fixes(cfg: dict, pages: list[dict]) -> list[dict]:
-    """DEFERRED: propose_loop_a() over the whole set -> reconcile() -> apply Tier-1 changes via
-    WP MCP -> persist checklist_status / manual_queue / changelog via db.upsert_page_state.
+def run_loop_a_fixes(cfg: dict, site: str, pages: list[dict], apply: bool = False,
+                     model_ref: dict | None = None) -> dict:
+    """Propose Tier-1 metadata for the in-scope set, verify it, and record the outcome.
 
-    The model call and the reconciliation are built and tested; the WP MCP write is the
-    remaining piece, which is why WIRED is still False. The shape it will take:
+    Everything up to the WordPress write is implemented and runs today. `apply` is the second
+    gate: with it off (the default) this proposes, reconciles, corrects lengths, queues Tier
+    2/3 work and persists our own state — but writes nothing to the live site. That makes a
+    full dress rehearsal against production data free of consequences.
 
-        gen = propose_loop_a(pages, cfg)
-        check = reconcile(gen.data, pages)
-        if not check["ok"]:
-            raise ...            # never write a batch that failed reconciliation
-        for url, proposal in check["by_url"].items():
-            ...                  # WP MCP Yoast write, then db.upsert_page_state
+    Returns a summary dict; the caller renders it. Raises rather than half-applying if the
+    batch fails reconciliation — a proposal that lost a page or duplicated metadata is not
+    something to partially trust.
     """
-    raise NotImplementedError(
-        "Loop A WP-MCP write path not built — the model call is scripts.agent.propose_loop_a.")
+    gen = propose_loop_a(pages, cfg, model_ref=model_ref)
+    check = reconcile(gen.data, pages)
+    if not check["ok"]:
+        raise RuntimeError("Loop A batch failed reconciliation: " + "; ".join(check["errors"]))
+
+    payload, still_off = refine_lengths(gen.data, pages, cfg, model_ref=model_ref)
+    by_url = {p["url"]: p for p in payload.get("pages", [])}
+
+    proposals: list[dict] = []
+    for page in pages:
+        proposal = by_url.get(page["url"], {})
+        changes = proposal.get("changes", [])
+        queue = proposal.get("manual_queue", [])
+
+        if apply:
+            # The WP MCP write lands here, and only here. Everything above is safe to run
+            # against production because nothing in it leaves the process.
+            raise NotImplementedError(
+                "--apply requires the WP MCP write path, which is not built yet.")
+
+        proposals.append({
+            "url": page["url"],
+            "changes": changes,
+            "manual_queue": queue,
+            "off_band": [m for m in still_off if m["url"] == page["url"]],
+        })
+        # Our own state is safe to record either way: manual_queue is a to-do list, not a
+        # content change. checklist_status stays whatever audit.py measured — it describes
+        # the live page, and until we apply, the live page has not moved.
+        if queue:
+            db.upsert_page_state(site, page["url"], {"manual_queue": queue})
+
+    return {
+        "applied": apply,
+        "model": f"{gen.provider}:{gen.model}",
+        "latency_s": gen.latency_s,
+        "repaired": gen.repaired,
+        "proposals": proposals,
+        "unresolved_bands": still_off,
+    }
+
+
+def render_proposals(summary: dict, pages: list[dict], cfg: dict) -> str:
+    """Human-readable diff of what Loop A would change — the thing to read before --apply."""
+    current = {p["url"]: p for p in pages}
+    out = [f"Loop A proposal · {summary['model']} · {summary['latency_s']}s"
+           f"{' · REPAIRED' if summary['repaired'] else ''}",
+           f"{'APPLIED to WordPress' if summary['applied'] else 'PROPOSAL ONLY — nothing written'}",
+           ""]
+    for p in summary["proposals"]:
+        page = current.get(p["url"], {})
+        out.append(p["url"])
+        for change in p["changes"]:
+            field = change["field"]
+            was = page.get("title") if field == "yoast_title" else page.get("metadesc")
+            out.append(f"  {field}")
+            out.append(f"    - {was!r} ({len(was or '')} chars)")
+            out.append(f"    + {change['new']!r} ({len(change['new'])} chars)")
+            if change.get("source_quote"):
+                out.append(f"    grounded in: {change['source_quote'][:90]!r}")
+        for q in p["manual_queue"]:
+            out.append(f"  queued tier{q['tier']}: {q['check']} — {q['note'][:80]}")
+        for m in p["off_band"]:
+            out.append(f"  ⚠ still off-band: {m['field']} {m['len']} chars "
+                       f"(want {m['min']}-{m['max']})")
+        out.append("")
+    return "\n".join(out)
 
 
 def run_loop_b_ranking(cfg: dict, site: str, run_date: str, weekly: dict) -> dict:

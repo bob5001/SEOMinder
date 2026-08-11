@@ -23,7 +23,8 @@ from .config import env
 
 # jsonb columns per table — values for these get wrapped so dicts/lists serialize correctly.
 JSONB_COLUMNS: dict[str, set[str]] = {
-    "seo_page_state": {"broken_links", "cwv_lab", "manual_queue", "changelog"},
+    "seo_page_state": {"broken_links", "cwv_lab", "manual_queue", "changelog",
+                       "lighthouse_seo_failures", "lighthouse_a11y_failures"},
     "seo_weekly": {"per_url", "opportunities", "editorial_gaps", "cwv_field"},
 }
 

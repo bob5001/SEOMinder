@@ -56,7 +56,17 @@ sampling:
     top_p: 0.95
     top_k: 64
   qwen3.6:
-    # Qwen3.6 dropped the /think soft switch; thinking is disabled via template kwargs.
+    # Qwen3.6 dropped the /think soft switch, so thinking must be disabled by request param.
+    # WHICH param depends on the RUNTIME, and getting it wrong fails silently:
+    #   vLLM   -> extra_body.chat_template_kwargs.enable_thinking: false
+    #   Ollama -> extra_body.reasoning_effort: "none"   <- what we run (ollama provider)
+    # chat_template_kwargs is a vLLM convention; Ollama's /v1 layer ignores unknown keys, so
+    # setting it here produced NO error — the model just kept thinking, burned the whole
+    # max_tokens budget on reasoning, and returned empty content with finish_reason=length.
+    # That scores as a schema failure and reads as "the model is bad at JSON" when the model
+    # is fine. Verified 2026-08-11: with reasoning_effort none the probe returns clean JSON in
+    # 6.5s; without it, 22s and empty. Re-check this line if the ollama provider ever moves to
+    # vLLM, and run scripts.models.preflight after any change here.
     # These are its NON-thinking values — switch to temp 1.0 / top_p 0.95 / presence 0.0
     # if you enable thinking (worth testing on loop_b_rank, which is pure analysis).
     temperature: 0.7
@@ -64,8 +74,7 @@ sampling:
     top_k: 20
     presence_penalty: 1.5
     extra_body:
-      chat_template_kwargs:
-        enable_thinking: false
+      reasoning_effort: "none"
   llama3.1:
     temperature: 0.7
     top_p: 0.9

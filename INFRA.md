@@ -88,18 +88,46 @@ heading_order_ok    bool
 alt_coverage_pct    float
 internal_links_out  int
 internal_links_in   int
-lighthouse_seo_pass bool
-lighthouse_a11y_pass bool
+lighthouse_seo_pass bool            # category score == 1.0
+lighthouse_a11y_pass bool           # the FOUR gate audits only (see below), not the category
+lighthouse_seo_failures  json       # ["meta-description", ...] failing audit ids
+lighthouse_a11y_failures json       # all failing a11y audit ids (gate + informational)
 indexable           bool
 schema_type         text
 schema_valid        bool
 broken_links        json            # [{url,status}]
 cwv_lab             json            # {lcp,cls,inp} (median of 3)
-checklist_status    text            # green | queued | failing
+content_excerpt     text            # visible body prose at audit time (~1400 chars)
+content_sha         text            # hash of the above; drift shows up in changelog
+checklist_status    text            # green | queued | blocked | failing  (COMPUTED, not generated)
 manual_queue        json            # [{tier, check, note}]  tier2/tier3 awaiting human
 last_audited_at     timestamptz
 changelog           json            # [{ts, field, old, new, by}]
 ```
+
+**The verdict is computed, not generated.** `scripts/checklist.py` derives `checklist_status`
+from the measured fields; `audit.py` persists it on every run. It was originally something the
+Loop A agent returned, which put model judgement in the path of a safety-relevant field and made
+it vary between runs for no benefit. The model proposes text; arithmetic decides the verdict.
+
+Two gating decisions worth keeping straight, because the original implementation was stricter
+than the loop spec and left every page permanently ungreen:
+
+- **Accessibility gates on four named audits** (`image-alt`, `heading-order`, `target-size`,
+  `font-size`) per `loops/loop-a-onpage.md`, not on a perfect category score. A flawless
+  Lighthouse accessibility category is not reachable on a real Elementor site.
+- **A failing Lighthouse SEO category is attributed per audit, not treated as one infra
+  failure.** `/support/` failed that category solely on `meta-description` — the exact field
+  Loop A writes. Blanket-classifying the category as infrastructure would have parked pages in
+  `blocked` that the loop can actually finish.
+
+`blocked` is the fourth status and the reason the loop can terminate at all: it means nothing
+remains that this loop or a human editor can fix — only platform-level work (Lighthouse
+category, lab CWV). Without it, "converge to all-green and halt" is unreachable on this site.
+
+`content_excerpt` + `content_sha` are persisted rather than fetched on demand so the agent can
+quote the page's own words when writing metadata, and so a ranking slide can be checked against
+whether the copy itself changed. A changed hash appends a `changelog` entry.
 
 ### `seo_weekly` — one row per (site, Loop B run), append-only
 ```

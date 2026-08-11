@@ -20,15 +20,18 @@ CLI (handy for dry runs):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
 import sys
+import time
+from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-from . import db
+from . import checklist, db
 from .config import env, load_site_config, site_slug
 
 PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
@@ -51,6 +54,31 @@ def registrable(host: str) -> str:
 
 
 # --- HTML parse -------------------------------------------------------------
+
+EXCERPT_CHARS = 1400
+
+
+def extract_prose(soup: BeautifulSoup) -> str:
+    """Visible body prose — what the page actually claims, minus the chrome.
+
+    Persisted with the audit for two reasons. The Loop A agent needs it to write a meta
+    description that is about the page (and to quote the claim it must preserve), and keeping
+    a snapshot per audit means a ranking slide can be checked against whether the copy itself
+    changed. Chrome carries no claims, so nav/header/footer/forms are dropped.
+    """
+    body = BeautifulSoup(str(soup), "lxml")
+    for tag in body(["script", "style", "nav", "header", "footer", "noscript", "form"]):
+        tag.decompose()
+    root = body.find("main") or body.find("article") or body.body or body
+    parts: list[str] = []
+    for el in root.find_all(["h1", "h2", "h3", "p", "li"]):
+        text = " ".join(el.get_text(" ", strip=True).split())
+        if len(text) > 25:                      # skip nav crumbs and one-word list items
+            parts.append(text)
+        if sum(len(p) for p in parts) > EXCERPT_CHARS:
+            break
+    return " ".join(parts)[:EXCERPT_CHARS]
+
 
 def parse_html(html: str, final_url: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
@@ -89,11 +117,16 @@ def parse_html(html: str, final_url: str) -> dict:
     # mixed content: http:// subresources on an https page
     mixed = _mixed_content(soup, final_url)
 
+    # body prose + a hash of it, so content drift between audits is detectable
+    prose = extract_prose(soup)
+
     return {
         "title": title,
         "title_len": len(title),
         "metadesc": metadesc,
         "metadesc_len": len(metadesc),
+        "content_excerpt": prose,
+        "content_sha": hashlib.sha256(prose.encode()).hexdigest()[:16] if prose else None,
         "h1_count": h1_count,
         "heading_order_ok": heading_order_ok,
         "alt_coverage_pct": alt_coverage_pct,
@@ -213,31 +246,97 @@ def check_links(urls: list[str], limit: int = 50) -> list[dict]:
 
 # --- PageSpeed Insights -----------------------------------------------------
 
+PSI_RETRIES = 3
+PSI_BACKOFF_S = 4
+
+
+def _scrub(text: str) -> str:
+    """Remove the PSI key from anything we log or raise.
+
+    requests puts the full request URL in HTTPError, so an upstream 500 wrote the API key
+    into the run log in clear text. Logs outlive the incident that produced them.
+    """
+    key = env("PSI_API_KEY") or ""
+    return text.replace(key, "<PSI_API_KEY>") if key else text
+
+
+def _psi_get(params: dict) -> requests.Response:
+    """PSI call with backoff on 5xx.
+
+    Google returns transient 500s under load. Without a retry, one of them anywhere in an
+    11-page sweep aborted the entire weekly run — including the pages that had already
+    succeeded, since persistence happens after the full pass.
+    """
+    last = ""
+    for attempt in range(PSI_RETRIES):
+        try:
+            r = requests.get(PSI_ENDPOINT, params=params, timeout=90)
+            if r.status_code < 500:
+                r.raise_for_status()
+                return r
+            last = f"HTTP {r.status_code}"
+        except requests.RequestException as err:
+            last = _scrub(f"{type(err).__name__}: {err}")
+        if attempt < PSI_RETRIES - 1:
+            time.sleep(PSI_BACKOFF_S * (attempt + 1))
+    raise RuntimeError(f"PSI failed after {PSI_RETRIES} attempts: {last}")
+
+
+# loop-a-onpage.md gates accessibility on FOUR named audits, not the whole category score.
+# Gating on a perfect category score is both stricter than the spec and unreachable on a real
+# Elementor site, which is how every page sat at "never green" regardless of Tier-1 work.
+A11Y_GATE_AUDITS = ("image-alt", "heading-order", "target-size", "font-size")
+
+
+def _failed_audit_ids(audits: dict, category: dict) -> list[str]:
+    """IDs of the audits this category actually failed, so a failure is actionable.
+
+    Storing only a pass/fail boolean meant nobody — human or agent — could see WHY a page
+    failed, which made the gate impossible to act on or to argue with.
+    """
+    failed: list[str] = []
+    for ref in (category or {}).get("auditRefs", []):
+        audit = audits.get(ref.get("id"), {})
+        score = audit.get("score")
+        # score is None for informational/manual audits — those are not failures.
+        if score is not None and score < 1.0:
+            failed.append(ref["id"])
+    return sorted(failed)
+
+
 def run_psi(url: str, api_key: str, strategy: str = "mobile", runs: int = 3) -> dict:
     """runs× PSI calls -> median lab CWV + SEO/A11y pass. Median of an odd N per INFRA.md."""
     seo_scores, a11y_scores = [], []
     lcp, cls, tbt = [], [], []
+    seo_failed: list[str] = []
+    a11y_failed: list[str] = []
+    a11y_gate_failed: list[str] = []
     for _ in range(max(1, runs)):
         params = {"url": url, "strategy": strategy,
                   "category": ["SEO", "ACCESSIBILITY", "PERFORMANCE"]}
         if api_key:
             params["key"] = api_key
-        r = requests.get(PSI_ENDPOINT, params=params, timeout=90)
-        r.raise_for_status()
+        r = _psi_get(params)
         lh = r.json().get("lighthouseResult", {})
         cats = lh.get("categories", {})
         audits = lh.get("audits", {})
         if "seo" in cats and cats["seo"].get("score") is not None:
             seo_scores.append(cats["seo"]["score"])
+            seo_failed = _failed_audit_ids(audits, cats["seo"])
         if "accessibility" in cats and cats["accessibility"].get("score") is not None:
             a11y_scores.append(cats["accessibility"]["score"])
+            a11y_failed = _failed_audit_ids(audits, cats["accessibility"])
+            a11y_gate_failed = [a for a in a11y_failed if a in A11Y_GATE_AUDITS]
         _push(lcp, audits.get("largest-contentful-paint"))
         _push(cls, audits.get("cumulative-layout-shift"))
         _push(tbt, audits.get("total-blocking-time"))
 
     return {
         "lighthouse_seo_pass": bool(seo_scores) and statistics.median(seo_scores) >= 1.0,
-        "lighthouse_a11y_pass": bool(a11y_scores) and statistics.median(a11y_scores) >= 1.0,
+        # Narrowed to the four audits the loop spec actually names.
+        "lighthouse_a11y_pass": bool(a11y_scores) and not a11y_gate_failed,
+        "lighthouse_seo_failures": seo_failed,
+        "lighthouse_a11y_failures": a11y_failed,
         "cwv_lab": {
             "lcp_ms": _median(lcp),
             "cls": _median(cls),
@@ -343,14 +442,26 @@ def main(argv: list[str] | None = None) -> int:
 
     run_id = None if args.dry_run else db.start_run(slug, "loop_a")
     results: dict[str, dict] = {}
+    failures: list[tuple[str, str]] = []
     try:
-        # first pass: audit every page, collect outbound internal targets for the graph
+        # first pass: audit every page, collect outbound internal targets for the graph.
+        # Per-page isolation matters because persistence happens in the SECOND pass: an
+        # exception here used to discard every page already audited, so one transient PSI
+        # error mid-sweep cost the whole weekly run.
         for t in targets:
-            parsed = audit_url(t["url"], psi_key, args.runs, do_psi, not args.no_links)
-            results[t["url"]] = {"parsed": parsed, "target": t}
+            try:
+                parsed = audit_url(t["url"], psi_key, args.runs, do_psi, not args.no_links)
+                results[t["url"]] = {"parsed": parsed, "target": t}
+            except Exception as err:
+                failures.append((t["url"], _scrub(f"{type(err).__name__}: {err}")[:300]))
+                print(f"[audit] FAILED {t['url']}: {failures[-1][1]}", file=sys.stderr)
+        if not results:
+            raise RuntimeError(f"every target failed; first error: {failures[0][1]}")
+
+        # prior state, for content-drift detection (one query, not one per page)
+        prior = {} if args.dry_run else {r["url"]: r for r in db.list_page_state(slug)}
 
         # second pass: inbound internal-link counts across the in-scope set (orphan check)
-        scoped = set(results.keys())
         for url, r in results.items():
             inbound = sum(
                 1 for other, o in results.items()
@@ -358,19 +469,39 @@ def main(argv: list[str] | None = None) -> int:
             )
             fields = column_fields(r["parsed"], r["target"]["post_id"], r["target"]["page_type"])
             fields["internal_links_in"] = inbound
+
+            # The verdict is arithmetic over measured fields, so it is settled here rather
+            # than asked of a model — same inputs always give the same answer.
+            verdict = checklist.evaluate(fields, cfg)
+            fields["checklist_status"] = verdict["status"]
+
+            was = prior.get(url) or {}
+            # Record body-copy drift. Cheap to store, and the reason it earns its place is
+            # diagnostic: when rankings slide, the first question is whether the page changed.
+            if was.get("content_sha") and fields.get("content_sha") != was["content_sha"]:
+                entry = {"ts": datetime.now(timezone.utc).isoformat(), "field": "content",
+                         "old": was["content_sha"], "new": fields["content_sha"], "by": "audit"}
+                fields["changelog"] = (was.get("changelog") or []) + [entry]
+                print(f"[audit] content changed: {url} ({was['content_sha']} -> "
+                      f"{fields['content_sha']})", file=sys.stderr)
+
             if args.dry_run:
-                print(json.dumps({"url": url, "fields": fields}, indent=2, default=str))
+                print(json.dumps({"url": url, "fields": fields,
+                                  "verdict": verdict}, indent=2, default=str))
             else:
                 db.upsert_page_state(slug, url, fields)
 
+        status = "partial" if failures else "ok"
         if run_id:
-            db.end_run(run_id, "ok")
-        print(f"[audit] {'(dry-run) ' if args.dry_run else ''}audited {len(results)} page(s) for '{slug}'.",
-              file=sys.stderr)
+            db.end_run(run_id, status,
+                       "; ".join(f"{u}: {e}" for u, e in failures) if failures else None)
+        print(f"[audit] {'(dry-run) ' if args.dry_run else ''}audited {len(results)}/"
+              f"{len(targets)} page(s) for '{slug}'"
+              f"{f' — {len(failures)} FAILED' if failures else ''}.", file=sys.stderr)
         return 0
     except Exception as e:
         if run_id:
-            db.end_run(run_id, "failed", str(e))
+            db.end_run(run_id, "failed", _scrub(str(e)))
         raise
 
 
