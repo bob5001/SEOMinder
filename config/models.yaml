@@ -47,10 +47,22 @@ routing:
 # top_p / top_k with a 400, and the CLI exposes no sampling knobs, so both Anthropic paths
 # ignore this block. `extra_body` carries anything outside the OpenAI schema (top_k is added
 # there automatically; per-family thinking toggles go there too).
+# Family blocks OVERLAY `default`, they do not replace it — so the thinking suppression and
+# its assertion are declared once here and inherited everywhere.
 sampling:
   default:
     temperature: 0.7
     top_p: 0.9
+    # These tasks are structured extraction, not open reasoning. Thinking here buys nothing
+    # and costs the output budget the 11-page batch needs. Measured 2026-08-13, trivial probe:
+    #   gemma4:26b  15.4s / 144c reasoning  ->  0.9s / 0c with this set
+    #   gemma4:31b  34.4s / 215c            ->  see preflight
+    #   qwen3.6:27b 58.2s / 607c            ->  28.9s / 0c
+    # Ollama silently drops parameters it does not recognise, so `expect_no_reasoning` makes
+    # preflight PROVE the toggle applied instead of assuming it did.
+    extra_body:
+      reasoning_effort: "none"
+    expect_no_reasoning: true
   gemma4:
     temperature: 1.0
     top_p: 0.95
@@ -75,6 +87,12 @@ sampling:
     presence_penalty: 1.5
     extra_body:
       reasoning_effort: "none"
+    # Not an API parameter — read by models.preflight, which then PROVES the toggle applied by
+    # requiring zero reasoning characters in the reply. Measured 2026-08-13 on Ollama 0.32.7:
+    # no toggle -> 607 chars; chat_template_kwargs -> 348 (a no-op); reasoning_effort none -> 0.
+    # A deliberately invalid parameter also produced no error, which is why we assert instead
+    # of assuming.
+    expect_no_reasoning: true
   llama3.1:
     temperature: 0.7
     top_p: 0.9

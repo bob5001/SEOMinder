@@ -108,7 +108,17 @@ def sampling_for(model: str) -> dict:
     for prefix in table:
         if prefix != "default" and model.startswith(prefix) and len(prefix) > len(best):
             best = prefix
-    return dict(table.get(best or "default", {}) or {})
+
+    # Family blocks OVERLAY the default rather than replacing it, so settings that should hold
+    # everywhere (suppressing thinking, and the assertion that proves it held) are written once
+    # instead of copied into every family and forgotten in the next one added.
+    merged = dict(table.get("default", {}) or {})
+    family = dict(table.get(best, {}) or {}) if best else {}
+    extra = {**(merged.get("extra_body") or {}), **(family.pop("extra_body", None) or {})}
+    merged.update(family)
+    if extra:
+        merged["extra_body"] = extra
+    return merged
 
 
 # --- public API -------------------------------------------------------------
@@ -128,6 +138,9 @@ def generate_json(model_ref: dict, prompt: str, schema: dict, *,
 
     if sampling is None:
         sampling = sampling_for(model_ref["model"])
+    sampling = dict(sampling)
+    # Our own metadata, not an API parameter — preflight reads it, the wire never sees it.
+    sampling.pop("expect_no_reasoning", None)
 
     started = time.monotonic()
     text, usage = complete(prov, model_ref["model"], system, prompt, schema, max_tokens, sampling)
@@ -176,6 +189,15 @@ def preflight(model_ref: dict) -> tuple[bool, str]:
         return False, f"{type(err).__name__}: {err}"[:200]
     if gen.data.get("n") != 7:
         return False, f"schema honoured but content wrong: {gen.data}"
+
+    # Prove the thinking toggle applied, rather than trusting that we sent it. A model that
+    # keeps reasoning spends its whole output budget on it and returns empty content with
+    # finish_reason=length — which looks like "bad at JSON" and is really a dropped parameter.
+    if sampling_for(model_ref["model"]).get("expect_no_reasoning"):
+        n = (gen.usage or {}).get("reasoning_chars", 0)
+        if n:
+            return False, (f"thinking NOT suppressed ({n} chars of reasoning) — the toggle in "
+                           f"config/models.yaml is being ignored by this runtime")
     return True, "repaired" if gen.repaired else "ok"
 
 
@@ -247,9 +269,14 @@ def _complete_openai(prov, model, system, prompt, schema, max_tokens, sampling=N
         )
     except openai.OpenAIError:  # server doesn't support json_schema -> plain JSON mode + our validator
         resp = client.chat.completions.create(response_format={"type": "json_object"}, **common)
-    text = resp.choices[0].message.content or ""
+    msg = resp.choices[0].message
+    text = msg.content or ""
     u = getattr(resp, "usage", None)
     usage = ({"input_tokens": u.prompt_tokens, "output_tokens": u.completion_tokens} if u else {})
+    # Surfaced so preflight can PROVE a thinking toggle took effect. Ollama's /v1 layer drops
+    # unknown parameters without complaint, so "we set the flag" is not evidence it applied.
+    usage["reasoning_chars"] = len(getattr(msg, "reasoning", None) or "")
+    usage["finish_reason"] = resp.choices[0].finish_reason
     return text, usage
 
 
