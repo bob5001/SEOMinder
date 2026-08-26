@@ -366,7 +366,12 @@ def _median(vals: list[float]) -> float | None:
 
 def resolve_targets(cfg: dict) -> list[dict]:
     """Resolve config post IDs to URLs via the WP REST API. `in_scope_urls` in the yaml,
-    if present, is used as-is (bypasses resolution). Unresolved IDs are reported, not fatal."""
+    if present, is used as-is (bypasses resolution). Unresolved IDs are reported, not fatal.
+
+    `in_scope_ids` (pages) and `in_scope_post_ids` (WP posts) are resolved identically — each
+    id is tried against both /pages/ and /posts/ regardless of which list it came from, so the
+    split is purely for readability/config-authoring, not a different code path.
+    """
     base = cfg["site"]["base_url"].rstrip("/")
     scope = cfg.get("scope", {})
     targets: list[dict] = []
@@ -374,8 +379,9 @@ def resolve_targets(cfg: dict) -> list[dict]:
     for url in scope.get("in_scope_urls", []) or []:
         targets.append({"url": url, "post_id": None, "page_type": None})
 
+    ids = list(scope.get("in_scope_ids", []) or []) + list(scope.get("in_scope_post_ids", []) or [])
     unresolved = []
-    for pid in scope.get("in_scope_ids", []) or []:
+    for pid in ids:
         hit = None
         for rest_type in ("pages", "posts"):
             try:

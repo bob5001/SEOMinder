@@ -26,11 +26,26 @@ thresholds:
   low_ctr_impressions_min: 100   # only flag low-CTR pages with real impression volume
 
 scope:
-  # Loop A in-scope informational/content pages
+  # Loop A in-scope informational/content pages (post_type: page)
   in_scope_ids: [2384, 2524, 2509, 2183, 2182, 2181, 2180, 2189, 206, 140, 2691]
-  on_publish_post_type: "post"   # /thesignal blog posts auto-run Loop A on publish
+  # /thesignal blog posts (post_type: post), added 2026-08-26. resolve_targets() already
+  # tries /wp-json/wp/v2/pages/{id} then /posts/{id}, so these need no code path of their
+  # own. Site had 20 published posts; 2778 excluded below (slug collision), the rest here.
+  in_scope_post_ids: [2784, 2782, 2780, 2776, 2774, 2772, 2770, 2768, 2766, 2764, 2762, 2760,
+                      2697, 2696, 2695, 2694, 2693, 2692, 2706]
+  on_publish_post_type: "post"   # /thesignal blog posts auto-run Loop A on publish (NOT YET
+                                 # WIRED — no code reads this key or hooks WP's publish event;
+                                 # today a post only enters scope by being listed above).
   # Never touch
-  exclude_ids: [1694, 1718, 2184, 2185, 2186, 2187, 2188, 1937]
+  exclude_ids: [1694, 1718, 2184, 2185, 2186, 2187, 2188, 1937,
+                2778]  # post "How To Track Patterns In Your Environment": IDENTICAL slug to
+                       # page 2183 (how-to-track-patterns-in-your-environment), which is
+                       # already in_scope and already Loop-A'd. Verified live 2026-08-26: WP's
+                       # rewrite priority serves the PAGE at that URL, so this post is
+                       # completely unreachable at its own permalink. Writing Yoast meta to it
+                       # would be pointless until a human resolves the collision on the WP side
+                       # (rename slug / redirect / merge). Do not move to in_scope_post_ids
+                       # without re-verifying the collision is gone.
   exclude_post_types: ["product"]
   # Detect + flag, never edit
   flag_only_ids: [2833]          # "FAQ (Schema Test Copy)" — near-dup / indexability problem
