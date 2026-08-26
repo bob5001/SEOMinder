@@ -99,6 +99,17 @@ broken_links        json            # [{url,status}]
 cwv_lab             json            # {lcp,cls,inp} (median of 3)
 content_excerpt     text            # visible body prose at audit time (~1400 chars)
 content_sha         text            # hash of the above; drift shows up in changelog
+yoast_readability_score int         # Yoast's own 0-100 score, read via WP MCP — SUPPLEMENTARY,
+                                    # not authoritative and not kept current by us. Yoast
+                                    # computes it client-side in the editor and only saves it
+                                    # when a human opens the post there; confirmed live that
+                                    # our own Yoast title/metadesc writes do NOT recompute it,
+                                    # and the WP MCP plugin exposes no reindex/recalculate tool.
+                                    # NULL means nobody has ever opened that post in the editor
+                                    # with Yoast active, not "score zero". See scripts.wp_mcp
+                                    # .get_yoast_readability_score. The SEO score (linkdex) is
+                                    # not stored at all — sitewide, no page has a focus
+                                    # keyphrase set, without which Yoast never computes it.
 checklist_status    text            # green | queued | blocked | failing  (COMPUTED, not generated)
 manual_queue        json            # [{tier, check, note}]  tier2/tier3 awaiting human
 last_audited_at     timestamptz

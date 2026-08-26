@@ -31,7 +31,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from . import checklist, db
+from . import checklist, db, wp_mcp
 from .config import env, load_site_config, site_slug
 
 PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
@@ -473,6 +473,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             fields = column_fields(r["parsed"], r["target"]["post_id"], r["target"]["page_type"])
             fields["internal_links_in"] = inbound
+
+            # Supplementary, not authoritative: Yoast's own readability score, read for free
+            # where a human already produced one. Isolated in its own try — a WP MCP hiccup
+            # here should not cost the page its real, measured fields below.
+            if r["target"].get("post_id"):
+                try:
+                    fields["yoast_readability_score"] = wp_mcp.get_yoast_readability_score(
+                        r["target"]["post_id"])
+                except Exception as err:
+                    print(f"[audit] could not fetch Yoast readability for {url}: {err}",
+                          file=sys.stderr)
 
             # The verdict is arithmetic over measured fields, so it is settled here rather
             # than asked of a model — same inputs always give the same answer.

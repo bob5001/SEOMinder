@@ -97,6 +97,26 @@ def update_post_meta(post_id: int, meta: dict[str, str]) -> Any:
     return call_tool("wp_update_post_meta", {"ID": post_id, "meta": meta})
 
 
+def get_yoast_readability_score(post_id: int) -> int | None:
+    """Yoast's own readability score (0-100 traffic light), if a human has ever run its
+    analysis for this post in the WP editor.
+
+    NOT a live signal: this is computed client-side by Yoast's JS analysis engine and only
+    saved when someone opens/saves the post in wp-admin — confirmed live, a page whose
+    title/metadesc WE rewrote through this same API kept an empty score afterward. There is
+    also no reindex/recalculate tool exposed anywhere in this plugin's tool list. Treat a
+    present value as "whatever a human last saw in the editor", never as current, and treat
+    an absent one as "nobody has ever opened this post there" rather than "0".
+    """
+    val = get_post_meta(post_id, key="_yoast_wpseo_content_score")
+    if val in (None, ""):
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
 def apply_yoast_changes(post_id: int, changes: list[dict]) -> dict[str, str]:
     """Apply a Loop A `changes` list (field/new pairs) to one post's Yoast meta in one call,
     then verify each field against a fresh read before trusting it.

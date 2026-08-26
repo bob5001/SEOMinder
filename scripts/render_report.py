@@ -68,8 +68,8 @@ def render_md(cfg: dict, pages: list[dict], weekly: dict | None) -> str:
         green = sum(1 for p in pages if p.get("checklist_status") == "green")
         L += [f"**{len(pages)} pages audited · {green} green · "
               f"{sum(1 for p in pages if p.get('broken_links'))} with broken links**", ""]
-        L += ["| Page | Title | Meta | H1 | Head | Alt% | In | Out | Idx | Schema | SEO | A11y | Status |",
-              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        L += ["| Page | Title | Meta | H1 | Head | Alt% | In | Out | Idx | Schema | SEO | A11y | Yoast RS† | Status |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for p in sorted(pages, key=lambda x: x["url"]):
             L.append("| " + " | ".join([
                 _slug(p["url"]),
@@ -84,8 +84,15 @@ def render_md(cfg: dict, pages: list[dict], weekly: dict | None) -> str:
                 _flag(p.get("schema_valid")),
                 _flag(p.get("lighthouse_seo_pass")),
                 _flag(p.get("lighthouse_a11y_pass")),
+                (str(p["yoast_readability_score"]) if p.get("yoast_readability_score") is not None else "—"),
                 p.get("checklist_status") or "—",
             ]) + " |")
+        L.append("")
+        L.append("†  Yoast's own readability score (0–100), read from postmeta as a bonus "
+                 "signal — NOT something this pipeline keeps current. Yoast computes it "
+                 "client-side in the WordPress editor and only saves it when a human opens "
+                 "the post there, so it reflects whenever that last happened, not this audit "
+                 "run — '—' means nobody ever has, including our own automated writes.")
         L.append("")
         broken = [(p["url"], p["broken_links"]) for p in pages if p.get("broken_links")]
         if broken:
