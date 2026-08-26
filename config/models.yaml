@@ -25,16 +25,27 @@ providers:
     kind: openai                        # local — Ollama's OpenAI-compatible endpoint
     base_url: http://localhost:11434/v1
     api_key_env: null                   # local, no key
+    # Model tags below are all `-seo` variants (see deploy/ollama/) with num_ctx PINNED via a
+    # Modelfile, not the base tags. This endpoint silently drops a per-request num_ctx —
+    # verified 2026-08-24 on Ollama 0.32.7, both top-level and nested under `options` — so a
+    # global context default set on this host for something else entirely (e.g. another tool
+    # wanting a 64k window) would otherwise leak into every SEOMinder call too. Baking it into
+    # the tag is the one mechanism Ollama actually honours regardless of which endpoint calls
+    # it. Details + rebuild instructions: deploy/ollama/README.md.
   vllm:
     kind: openai                        # local — vLLM OpenAI server
     base_url: http://localhost:8000/v1
     api_key_env: null
 
 # Production routing: task -> which model runs it.
-# Both currently go through the subscription. Revisit per task once the bake-off says
-# which local models hold up — a local winner removes the metered path entirely.
 routing:
-  loop_a_meta: { provider: claude_cli, model: claude-opus-5 }    # YMYL meta text -> capable
+  # Routed to the bake-off's local winner 2026-08-25, UNTIL FURTHER NOTICE, after claude-opus-5
+  # reproduced the bake-off's documented failure on a real live run: 'tier' dropped from a
+  # change object, ValidationError even after generate_json's repair round. claude_cli cannot
+  # constrain decoding (no response_format schema), so it asks for the shape and validates
+  # after; gemma4:31b gets it via constrained decoding on Ollama's /v1 and scored 3/3 JSON-valid
+  # in the sweep (vs claude-opus-5's 0/3). See reports/bakeoff-loop_a_meta-2026-08-14.md.
+  loop_a_meta: { provider: ollama, model: "gemma4:31b-seo" }
   loop_b_rank: { provider: claude_cli, model: claude-sonnet-5 }  # ranking + rationale
 
 # Sampling parameters, matched to a model by LONGEST PREFIX (scripts.models.sampling_for).
@@ -105,13 +116,13 @@ bakeoff:
   loop_a_meta:
     - { provider: claude_cli, model: claude-opus-5 }
     - { provider: claude_cli, model: claude-sonnet-5 }
-    - { provider: ollama,     model: "gemma4:31b" }
-    - { provider: ollama,     model: "gemma4:26b" }
-    - { provider: ollama,     model: "qwen3.6:27b" }
-    - { provider: ollama,     model: "llama3.1:8b" }
+    - { provider: ollama,     model: "gemma4:31b-seo" }
+    - { provider: ollama,     model: "gemma4:26b-seo" }
+    - { provider: ollama,     model: "qwen3.6:27b-seo" }
+    - { provider: ollama,     model: "llama3.1:8b-seo" }
   loop_b_rank:
     - { provider: claude_cli, model: claude-sonnet-5 }
-    - { provider: ollama,     model: "qwen3.6:27b" }
-    - { provider: ollama,     model: "gemma4:26b" }
-    - { provider: ollama,     model: "gemma4:31b" }
-    - { provider: ollama,     model: "llama3.1:8b" }
+    - { provider: ollama,     model: "qwen3.6:27b-seo" }
+    - { provider: ollama,     model: "gemma4:26b-seo" }
+    - { provider: ollama,     model: "gemma4:31b-seo" }
+    - { provider: ollama,     model: "llama3.1:8b-seo" }

@@ -24,8 +24,9 @@ Two gates, deliberately separate (measure twice, cut once):
   --apply   proposals are actually written to WordPress. Off by default, so a wired run
             proposes, persists state, and prints a diff without touching the live site.
 
-Still to build before --apply can do anything: the WP MCP write path. Loop B has no content
-write, so `run_loop_b_ranking` is fully implementable today.
+--apply writes through scripts.wp_mcp (JSON-RPC 2.0 over the site's WP MCP plugin) — plain WP
+REST cannot do this write, Yoast's fields aren't `show_in_rest`. Loop B has no content write, so
+`run_loop_b_ranking` needed no gate on this at all.
 
 Loop A runs as ONE call over the whole in-scope set. Titles and descriptions have to be
 unique, and uniqueness is a property of the set — a model shown one page at a time cannot
@@ -42,12 +43,13 @@ Bake-off interface (scripts.bakeoff scores; it calls these):
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
-from . import checklist, db
+from . import checklist, db, wp_mcp
 from .models import Generation, generate_json, preflight, route_for
 
 # Gate 1: does the agent step run at all?
-WIRED = False
+WIRED = True
 
 
 def agent_available() -> bool:
@@ -273,13 +275,16 @@ def out_of_band(payload: dict, cfg: dict) -> list[dict]:
 
 
 def refine_lengths(payload: dict, pages: list[dict], cfg: dict, model_ref: dict | None = None,
-                   max_rounds: int = 2) -> tuple[dict, list[dict]]:
+                   max_rounds: int = 2, base_taken: dict | None = None) -> tuple[dict, list[dict]]:
     """Re-ask only the pages that missed a band, feeding back the measured overage.
 
     Re-running the whole batch to fix two long titles wastes the expensive path and risks
     perturbing text that was already correct. So each round re-asks just the offending pages —
     and passes every accepted title/description as `taken`, which is exactly what that
     parameter is for: a partial re-ask that still cannot collide with what we are keeping.
+    `base_taken` seeds this with titles/descs already live on OTHER pages of the site (see
+    run_loop_a_fixes) — required when `pages` is a subset, or a retry could reproduce a title
+    that already exists outside the batch it can see.
 
     Returns (merged_payload, remaining_misses).
     """
@@ -296,8 +301,10 @@ def refine_lengths(payload: dict, pages: list[dict], cfg: dict, model_ref: dict 
         if not retry_pages:
             break
 
-        # Everything we are keeping is off-limits for the retry.
-        taken = {"titles": [], "descs": []}
+        # Everything we are keeping is off-limits for the retry, plus anything already live
+        # elsewhere on the site.
+        base = base_taken or {}
+        taken = {"titles": list(base.get("titles", [])), "descs": list(base.get("descs", []))}
         for url, page in by_url.items():
             if url in bad_urls:
                 continue
@@ -454,29 +461,86 @@ def run_loop_a_fixes(cfg: dict, site: str, pages: list[dict], apply: bool = Fals
     batch fails reconciliation — a proposal that lost a page or duplicated metadata is not
     something to partially trust.
     """
-    gen = propose_loop_a(pages, cfg, model_ref=model_ref)
+    # `pages` may be the whole in-scope set (nothing else exists to collide with) or a subset
+    # (the on-publish variant, or a human applying one chosen page at a time) — in the subset
+    # case, whatever is already live on the REST of the site is still off-limits.
+    requested_urls = {p["url"] for p in pages}
+    others = [p for p in db.list_page_state(site) if p["url"] not in requested_urls]
+    taken = {"titles": [p["title"] for p in others if p.get("title")],
+             "descs": [p["metadesc"] for p in others if p.get("metadesc")]}
+
+    gen = propose_loop_a(pages, cfg, taken=taken, model_ref=model_ref)
     check = reconcile(gen.data, pages)
     if not check["ok"]:
         raise RuntimeError("Loop A batch failed reconciliation: " + "; ".join(check["errors"]))
 
-    payload, still_off = refine_lengths(gen.data, pages, cfg, model_ref=model_ref)
+    payload, still_off = refine_lengths(gen.data, pages, cfg, model_ref=model_ref, base_taken=taken)
     by_url = {p["url"]: p for p in payload.get("pages", [])}
+
+    # The model was told what's `taken`, but that's a prompt, not a guarantee — same
+    # discipline as the in-batch collisions() check, just against the rest of the site.
+    taken_by_field = {"yoast_title": set(taken["titles"]), "yoast_metadesc": set(taken["descs"])}
 
     proposals: list[dict] = []
     for page in pages:
         proposal = by_url.get(page["url"], {})
         changes = proposal.get("changes", [])
-        queue = proposal.get("manual_queue", [])
+        queue = list(proposal.get("manual_queue", []))
+        written: dict[str, str] = {}
 
-        if apply:
+        off_band_fields = {m["field"] for m in still_off if m["url"] == page["url"]}
+        safe_changes = []
+        for change in changes:
+            if change.get("new") in taken_by_field.get(change["field"], ()):
+                queue.append({"tier": 2, "check": "wp_write",
+                             "note": f"{change['field']} duplicates text already live on "
+                                     f"another page — queued for a human instead of written."})
+            elif change["field"] in off_band_fields:
+                # Still outside its character band after every retry round — a model that
+                # missed the length twice gets no benefit of the doubt on content quality
+                # either (this is exactly how a length-retry artifact/corruption would surface).
+                queue.append({"tier": 2, "check": "wp_write",
+                             "note": f"{change['field']} still off character-band after retries "
+                                     f"— queued for a human instead of written: {change['new']!r}"})
+            else:
+                safe_changes.append(change)
+        changes = safe_changes
+
+        db_fields: dict = {}
+
+        if apply and changes:
             # The WP MCP write lands here, and only here. Everything above is safe to run
             # against production because nothing in it leaves the process.
-            raise NotImplementedError(
-                "--apply requires the WP MCP write path, which is not built yet.")
+            post_id = page.get("post_id")
+            if not post_id:
+                queue.append({"tier": 2, "check": "wp_write",
+                             "note": "no post_id on record — add this page to "
+                                     "scope.in_scope_ids so Loop A can write it."})
+            else:
+                try:
+                    written = wp_mcp.apply_yoast_changes(post_id, changes)
+                except wp_mcp.WPMCPError as err:
+                    queue.append({"tier": 2, "check": "wp_write",
+                                 "note": f"WP MCP write failed, nothing changed on this page: "
+                                         f"{err}"})
+
+            if written:
+                now = datetime.now(timezone.utc).isoformat()
+                changelog = list(page.get("changelog") or [])
+                for change in changes:
+                    if wp_mcp.YOAST_META_KEY.get(change["field"]) not in written:
+                        continue
+                    changelog.append({"ts": now, "field": change["field"],
+                                      "old": change.get("old"), "new": change["new"],
+                                      "by": "loop_a"})
+                # Only changelog here — title/metadesc/*_len columns stay whatever the next
+                # real audit measures from the live rendered page, not what we assume we wrote.
+                db_fields["changelog"] = changelog
 
         proposals.append({
             "url": page["url"],
             "changes": changes,
+            "applied": bool(written) if apply else False,
             "manual_queue": queue,
             "off_band": [m for m in still_off if m["url"] == page["url"]],
         })
@@ -484,7 +548,9 @@ def run_loop_a_fixes(cfg: dict, site: str, pages: list[dict], apply: bool = Fals
         # content change. checklist_status stays whatever audit.py measured — it describes
         # the live page, and until we apply, the live page has not moved.
         if queue:
-            db.upsert_page_state(site, page["url"], {"manual_queue": queue})
+            db_fields["manual_queue"] = queue
+        if db_fields:
+            db.upsert_page_state(site, page["url"], db_fields)
 
     return {
         "applied": apply,
@@ -505,7 +571,10 @@ def render_proposals(summary: dict, pages: list[dict], cfg: dict) -> str:
            ""]
     for p in summary["proposals"]:
         page = current.get(p["url"], {})
-        out.append(p["url"])
+        tag = ""
+        if summary["applied"] and p["changes"]:
+            tag = "  ✓ written" if p["applied"] else "  ✗ NOT written — see queue"
+        out.append(p["url"] + tag)
         for change in p["changes"]:
             field = change["field"]
             was = page.get("title") if field == "yoast_title" else page.get("metadesc")
