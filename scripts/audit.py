@@ -404,6 +404,24 @@ def resolve_targets(cfg: dict) -> list[dict]:
     return targets
 
 
+def resolve_url_post_id(base: str, url: str) -> tuple[int | None, str | None]:
+    """Resolve a single known URL to its WP post_id/type by slug — what `--url` was missing
+    to ever be able to `--apply`. Without a post_id, the WP MCP write path has nothing to
+    write to and every change gets queued for a human instead (see agent.run_loop_a_fixes),
+    so `--url ... --apply` on an existing page silently never wrote anything until this."""
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    for rest_type in ("pages", "posts"):
+        try:
+            r = fetch(f"{base}/wp-json/wp/v2/{rest_type}?slug={slug}")
+        except requests.RequestException:
+            continue
+        if r.status_code == 200:
+            for item in r.json():
+                if item.get("link", "").rstrip("/") == url.rstrip("/"):
+                    return item["id"], item.get("type")
+    return None, None
+
+
 # --- orchestration ----------------------------------------------------------
 
 def audit_url(url: str, psi_key: str | None, runs: int, do_psi: bool, do_links: bool) -> dict:
@@ -443,7 +461,11 @@ def main(argv: list[str] | None = None) -> int:
         print("[audit] PSI_API_KEY not set — skipping Lighthouse/CWV (HTML parse only).", file=sys.stderr)
 
     if args.url:
-        targets = [{"url": args.url, "post_id": None, "page_type": None}]
+        pid, ptype = resolve_url_post_id(cfg["site"]["base_url"].rstrip("/"), args.url)
+        if pid is None:
+            print(f"[audit] could not resolve a post_id for {args.url} by slug — "
+                  f"--apply will have nothing to write to.", file=sys.stderr)
+        targets = [{"url": args.url, "post_id": pid, "page_type": ptype}]
     else:
         targets = resolve_targets(cfg)
     if not targets:

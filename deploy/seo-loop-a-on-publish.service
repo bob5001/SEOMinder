@@ -1,0 +1,17 @@
+# Host systemd service — runs the one-shot container, then exits.
+# Install: copy to /etc/systemd/system/ (edit paths/User), then enable the .timer (not this).
+[Unit]
+Description=Signal Sanctuary SEO Loop A on-publish poll (auto-applies newly published content)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=robert
+WorkingDirectory=/srv/seo-loops
+# flock prevents overlap if one poll runs long into the next tick.
+ExecStart=/usr/bin/flock -n /srv/seo-loops/.loop-a-on-publish.lock \
+    /srv/seo-loops/deploy/run-loop-a-on-publish.sh
+# Generous relative to the 10-minute poll interval, but this writes to WordPress on a model
+# call per new item — should never approach this in practice.
+TimeoutStartSec=10m

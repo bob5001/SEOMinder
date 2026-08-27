@@ -2,8 +2,8 @@
 # NO scheduler inside the container — the host owns scheduling + locking.
 #
 # State lives in Neon Postgres (DATABASE_URL in .env), reached over the internet — the runner needs
-# only outbound network access (the default bridge), no shared docker network. GSC / PSI / Anthropic /
-# WP MCP and the optional CodeManager broker are all reached the same way.
+# only outbound network access. GSC / PSI / Anthropic / WP MCP and the optional CodeManager broker
+# are all reached the same way.
 
 services:
   loop-runner:
@@ -13,6 +13,14 @@ services:
     image: seo-loops:latest
     env_file:
       - .env
+    # network_mode: host, not the default bridge — config/models.yaml's ollama provider is
+    # http://localhost:11434/v1, and Ollama runs on the HOST, not in a container of its own.
+    # On the default bridge, `localhost` inside the container means the container itself, so
+    # every Ollama call would fail to connect — the routed model for loop_a_meta as of
+    # 2026-08-25. This bit nothing yet only because every run so far has been driven directly
+    # on the host (.venv), never through `docker compose run`. Linux-only, which is fine —
+    # production is the Proxmox Docker host per INFRA.md, not Docker Desktop.
+    network_mode: host
     volumes:
       - ./reports:/app/reports          # committed md history (dashboard-lite)
       - ./logs:/app/logs

@@ -6,7 +6,8 @@ Runs on the Proxmox Docker box (host systemd fires a one-shot container). Portab
 ## Layout
 ```
 loops/      loop-a-onpage.md, loop-b-weekly.md   (the /goal + weekly agent prompts)
-scripts/    gsc_pull.py, audit.py, render_report.py, run_loop_a.py, run_loop_b.py
+scripts/    gsc_pull.py, audit.py, agent.py, wp_mcp.py, render_report.py,
+            run_loop_a.py, run_loop_a_on_publish.py, run_loop_b.py
 config/     <site>.yaml  (per-client seam — domain, scope IDs, thresholds, webhook)
 reports/    committed weekly md history (dashboard-lite)
 deploy/     Dockerfile, requirements.txt, compose is at repo root; systemd unit+timer, wrapper
@@ -25,13 +26,17 @@ The CodeManager broker is a separate agent-knowledge layer (out-of-band task led
   for Loop A, emits editorial gaps, posts a Discord digest. Not a convergence loop.
 
 ## Status (Aug 2026) — you are here
-The whole **deterministic** system is built and **validated live** against signalsanctuary.health:
-Neon state store, all five scripts, both orchestrators, md reports, and a working Discord digest.
-A full baseline is committed at `reports/2026-08-04.md` (11 in-scope pages).
-
-**The one remaining build is the agent step** — `scripts/agent.py` (`WIRED=False`): Loop A's Tier-1
-Yoast auto-fixes + the authoritative `checklist_status` + the `/goal` command, then Loop B's
-opportunity ranking. Until it's wired, the orchestrators run the deterministic pipeline and skip it.
+Deterministic system + agent step are both built and **validated live** against
+signalsanctuary.health, writes included: Neon state store, all scripts, both orchestrators, md
+reports, a working Discord digest, `scripts/agent.py` (`WIRED=True`), and `scripts/wp_mcp.py` —
+the JSON-RPC client that does the actual Yoast writes (plain WP REST can't; Yoast's fields
+aren't `show_in_rest`). Routing moved off `claude -p` for Loop A's meta task — `config/
+models.yaml` routes `loop_a_meta` to a local Ollama model (`gemma4:31b-seo`) after the
+subscription CLI path reproduced a real schema-validation failure live; see the file's own
+comments for why. Both pages AND posts are in scope (`scope.in_scope_ids` /
+`in_scope_post_ids`). `scripts/run_loop_a_on_publish.py` polls for newly-published content and
+auto-applies Loop A per item — see its docstring; `deploy/seo-loop-a-on-publish.timer` is the
+10-minute poll.
 For the running detail, read the latest CodeManager visit (`get_project_detail` + `get_visit_history`
 on the id in `codemanager.md`) — the newest visit is the source of truth for "where we are."
 
@@ -48,25 +53,30 @@ Never gate: Yoast composite, Flesch, third-party DA/DR, vendor GEO scores.
 4. ~~`scripts/gsc_pull.py` (service account, webmasters.readonly).~~ **DONE** — validated live (Search Analytics, URL Inspection, CrUX).
 5. ~~`scripts/render_report.py` (Postgres -> md -> Discord webhook).~~ **DONE** — md + a live Discord digest verified.
    - `scripts/run_loop_a.py` / `run_loop_b.py` thin orchestrators **DONE** (deterministic pipeline). The `claude -p` agent step is staged behind a seam (`scripts/agent.py`, `WIRED=False`) — **the next task** (see "The agent step" below).
-6. Wire Loop A manually first (dry-run: detect only, no writes) to validate the checklist against Postgres.
-7. Turn on Tier 1 auto-fix for Loop A.
-8. Install the systemd timer for Loop B; verify with `systemctl list-timers`.
+6. ~~Wire Loop A manually first (dry-run: detect only, no writes) to validate the checklist against Postgres.~~ **DONE.**
+7. ~~Turn on Tier 1 auto-fix for Loop A.~~ **DONE** — live on both pages and posts, `scripts/wp_mcp.py`.
+8. Install the systemd timer for Loop B; verify with `systemctl list-timers`. **Files ready
+   (`deploy/seo-loop-b.{service,timer}`), not yet installed on the host — still open.**
+9. Install the systemd timer for Loop A's on-publish trigger (`deploy/seo-loop-a-on-publish.
+   {service,timer}`) — polls every 10 min, auto-applies. **Files ready, not yet installed.**
 
-## The agent step (the next build)
-The loops' judgment + content-write half runs via `claude -p` (`scripts/agent.py`, currently
-`WIRED=False`, so the orchestrators run deterministically and skip it). The **agreed contract** — honour it:
+## The agent step (built — the contract it actually honours)
+The loops' judgment + content-write half is `scripts/agent.py` (`WIRED=True`), model-agnostic —
+`config/models.yaml` routes each task to a provider (currently a local Ollama model for
+`loop_a_meta`, `claude -p` on the subscription for `loop_b_rank`); `scripts.models` is the seam,
+so swapping either is a config change, not a code change. The **contract**:
 - **The agent never writes to Postgres.** It returns structured JSON; the orchestrator persists via
   `db.py` — `db.py` is the single writer. Exact JSON shapes are in `scripts/agent.py`'s docstring.
-- **The agent's only live writes are content writes via the WP MCP** (Yoast meta on Loop A),
-  Tier-gated: Tier 1 auto-fix; Tier 2/3 detect + queue. (WP backs up daily / 7 days — rollback net.)
-- **Reads use a read-only DB query tool** (the hybrid), or a snapshot the orchestrator pre-loads.
+- **The agent's only live writes are content writes via `scripts/wp_mcp.py`** (Yoast meta on
+  Loop A), Tier-gated: Tier 1 auto-fix; Tier 2/3 detect + queue. Two more gates sit in front of
+  every write: a sitewide title/description collision check, and a still-out-of-band-after-
+  retries check — both queue for a human instead of writing rather than trusting the model's
+  output at face value. (WP backs up daily / 7 days — rollback net.)
 - **Out-of-band, non-content tasks** (redirects, hosting/CWV, Tier-3) → logged to the CodeManager
   broker, not Postgres.
 
-Also build here: the **`/goal` custom slash command** (a `.claude/commands/goal.md` or skill) that runs
-`run_loop_a` for the in-scope pages. Creds (`ANTHROPIC_API_KEY`, `WP_MCP_TOKEN`) are in `.env`. Validate
-the `claude -p` invocation (flags, `--mcp-config`, `--allowedTools`, `--output-format json`, reply
-parsing) against the live CLI **before** flipping `WIRED=True`.
+No `/goal` slash command was built — Loop A is invoked directly (`run_loop_a.py`, or the
+on-publish poller above), which turned out sufficient in practice.
 
 ## Setup
 ```
@@ -76,10 +86,16 @@ mkdir -p secrets && cp /path/to/gsc_sa.json secrets/gsc_sa.json
 docker compose build
 # dry run:
 docker compose run --rm loop-runner python -m scripts.run_loop_b
-# schedule:
+# schedule Loop B (weekly):
 sudo cp deploy/seo-loop-b.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now seo-loop-b.timer
+# schedule Loop A on-publish (every 10 min, auto-applies to newly published content):
+sudo cp deploy/seo-loop-a-on-publish.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now seo-loop-a-on-publish.timer
 ```
+`docker-compose.yml` runs `loop-runner` with `network_mode: host` — required for the container
+to reach Ollama on `localhost:11434` (the host's, not its own). Linux-only; fine here since
+production is the Proxmox Docker host, not Docker Desktop.
 
 ### Local development (run scripts directly, no container)
 ```
