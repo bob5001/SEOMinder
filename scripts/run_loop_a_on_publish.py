@@ -81,9 +81,12 @@ def discover_new(cfg: dict, slug: str) -> list[dict]:
     return found
 
 
-def process_new_post(cfg: dict, slug: str, post_id: int, url: str) -> dict:
-    """Audit + Loop A (auto-apply) one freshly-discovered item. Isolated — a failure here
-    must not crash the rest of the poll, so the caller wraps this in its own try/except."""
+def _measure_and_persist(cfg: dict, slug: str, post_id: int, url: str) -> dict:
+    """Crawl the live page, compute the same fields the regular audit does, and persist.
+    Called twice per item: once before Loop A (so it has real content to write from), once
+    after a successful apply (so checklist_status reflects what's actually live, not the
+    pre-write snapshot — verified live that Yoast's write updates the rendered <title>/<meta
+    description> immediately, so a re-crawl right after applying is not a race)."""
     parsed = audit.audit_url(url, None, runs=0, do_psi=False, do_links=True)
     fields = audit.column_fields(parsed, post_id, "post")
     # No sitewide crawl happens for a single new item, so inbound links are measured as 0
@@ -97,6 +100,13 @@ def process_new_post(cfg: dict, slug: str, post_id: int, url: str) -> dict:
     except Exception as err:
         print(f"[on_publish] could not fetch Yoast readability for {url}: {err}", file=sys.stderr)
     db.upsert_page_state(slug, url, fields)
+    return fields
+
+
+def process_new_post(cfg: dict, slug: str, post_id: int, url: str) -> dict:
+    """Audit + Loop A (auto-apply) one freshly-discovered item. Isolated — a failure here
+    must not crash the rest of the poll, so the caller wraps this in its own try/except."""
+    _measure_and_persist(cfg, slug, post_id, url)
 
     page = db.get_page_state(slug, url)
     try:
@@ -105,6 +115,11 @@ def process_new_post(cfg: dict, slug: str, post_id: int, url: str) -> dict:
         return {"url": url, "post_id": post_id, "status": "AGENT_FAILED", "error": str(err)}
 
     proposal = summary["proposals"][0] if summary["proposals"] else {}
+    if proposal.get("applied") and proposal.get("changes"):
+        # Something actually landed on WordPress — re-measure so checklist_status and
+        # title/metadesc reflect the live page, not the pre-write crawl above.
+        _measure_and_persist(cfg, slug, post_id, url)
+
     return {"url": url, "post_id": post_id, "status": "OK", "proposal": proposal}
 
 
