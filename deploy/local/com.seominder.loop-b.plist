@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.seominder.loop-b</string>
+
+    <!-- lockf is macOS's flock(1) equivalent (not shipped on macOS); -t 0 = fail immediately
+         rather than wait, matching the Linux systemd unit's `flock -n`. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/lockf</string>
+        <string>-t</string>
+        <string>0</string>
+        <string>/Users/robertkoch/Projects/SEOMinder/.loop-b.lock</string>
+        <string>/Users/robertkoch/Projects/SEOMinder/deploy/local/run-loop-b.sh</string>
+    </array>
+
+    <!-- Weekly, Monday 06:00 — matches deploy/seo-loop-b.timer's OnCalendar. If the Mac is
+         asleep/off at that time, launchd runs it once on wake (built-in, no extra config
+         needed — the macOS equivalent of systemd's Persistent=true). -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Fires once immediately on load too, so loading this can be verified without waiting
+         for Monday. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- launchd LaunchAgents get a minimal PATH (no shell rc files sourced), which doesn't
+         include where `claude` lives (~/.local/bin) — models.py finds it via shutil.which(),
+         so without this loop_b_rank's claude_cli route silently reports "unavailable" and
+         Loop B skips ranking entirely. Verified live 2026-08-27. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/robertkoch/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/robertkoch/Projects/SEOMinder/logs/launchd-loop-b.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/robertkoch/Projects/SEOMinder/logs/launchd-loop-b.err.log</string>
+</dict>
+</plist>

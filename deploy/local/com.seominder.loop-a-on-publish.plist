@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.seominder.loop-a-on-publish</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/lockf</string>
+        <string>-t</string>
+        <string>0</string>
+        <string>/Users/robertkoch/Projects/SEOMinder/.loop-a-on-publish.lock</string>
+        <string>/Users/robertkoch/Projects/SEOMinder/deploy/local/run-loop-a-on-publish.sh</string>
+    </array>
+
+    <!-- Every 10 minutes — matches deploy/seo-loop-a-on-publish.timer's OnUnitActiveSec.
+         AUTO-APPLIES to WordPress on anything new it finds, unattended, per the earlier
+         design decision. -->
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- See com.seominder.loop-b.plist — same launchd-PATH gotcha. loop_a_meta currently
+         routes to ollama (no CLI involved), but set for consistency / in case routing
+         changes back to claude_cli. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/robertkoch/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/robertkoch/Projects/SEOMinder/logs/launchd-loop-a-on-publish.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/robertkoch/Projects/SEOMinder/logs/launchd-loop-a-on-publish.err.log</string>
+</dict>
+</plist>

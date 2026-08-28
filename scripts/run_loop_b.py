@@ -11,7 +11,8 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import agent, gsc_pull, render_report
+from . import agent, db, gsc_pull, render_report
+from .config import load_site_config, site_slug
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -51,7 +52,18 @@ def main(argv: list[str] | None = None) -> int:
         print("[loop_b] agent unavailable (no ANTHROPIC_API_KEY / claude CLI) — skipping ranking step.",
               file=sys.stderr)
     else:
-        agent.run_loop_b_ranking  # wired path lives here
+        cfg = load_site_config(f"config/{args.site}.yaml" if args.site else None)
+        slug = site_slug(cfg)
+        weekly = db.get_latest_weekly(slug)
+        if not weekly:
+            print("[loop_b] no weekly row to rank (gsc_pull produced nothing) — skipping.",
+                  file=sys.stderr)
+        else:
+            try:
+                agent.run_loop_b_ranking(cfg, slug, str(weekly["run_date"]), weekly)
+            except Exception as err:
+                print(f"[loop_b] ranking step failed, nothing ranked this run: {err}",
+                      file=sys.stderr)
 
     # 3. render — projection of Postgres -> reports/<date>.md (+ Discord).
     if not args.no_render:
