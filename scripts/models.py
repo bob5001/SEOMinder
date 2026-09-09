@@ -156,7 +156,17 @@ def generate_json(model_ref: dict, prompt: str, schema: dict, *,
         )
         text, usage2 = complete(prov, model_ref["model"], system, repair_prompt, schema,
                                 max_tokens, sampling)
-        usage = {k: usage.get(k, 0) + usage2.get(k, 0) for k in set(usage) | set(usage2)}
+        # Numeric fields (token counts) sum across the two calls; non-numeric ones (e.g. the
+        # OpenAI-adapter's "finish_reason", which can legitimately be a string or None) don't
+        # add — keep the repair call's value, since it's the one that produced `text`. A blind
+        # `+` here crashed with "unsupported operand ... NoneType and str" the moment a
+        # finish_reason was None on either call, masking the real (and intended-to-surface)
+        # invalid-JSON error from `_validate` below with an opaque one instead.
+        def _merge(a, b):
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                return a + b
+            return b if b is not None else a
+        usage = {k: _merge(usage.get(k), usage2.get(k)) for k in set(usage) | set(usage2)}
         data = _validate(text, schema)  # raises if still invalid — caller/bake-off records the failure
 
     return Generation(
