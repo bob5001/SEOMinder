@@ -52,23 +52,50 @@ from .models import Generation, generate_json, preflight, route_for
 WIRED = True
 
 
-def agent_available() -> bool:
-    """Whether the routed provider for the agent step can actually be reached.
+def agent_available(task: str) -> tuple[bool, str]:
+    """Whether the routed provider for `task` specifically can be reached. Returns (ok, reason)
+    — reason is empty on success, else the preflight failure detail (or the exception that kept
+    preflight from even running, e.g. a missing route in config/models.yaml).
 
-    Previously this checked for ANTHROPIC_API_KEY, which is now the wrong signal twice over:
-    production routes through the Claude CLI on the subscription (no API key), and local
-    models need no credential at all. It also silently disappeared in an earlier refactor
-    while both orchestrators kept calling it — masked only because `not WIRED` short-circuits
-    first, so flipping WIRED would have raised AttributeError on the first real run.
+    Scoped to ONE task on purpose. An earlier version checked both loop_a_meta (routed to
+    Ollama) and loop_b_rank (routed to claude_cli) together and required both to pass — so an
+    Ollama outage silently skipped Loop B's Sonnet ranking too, and vice versa, even though the
+    two routes are independent failure domains. Previously this also checked for
+    ANTHROPIC_API_KEY, which was the wrong signal twice over: production routes through the
+    Claude CLI on the subscription (no API key), and local models need no credential at all.
+
+    See check_availability for the version that also logs the result and reports whether it's
+    a CHANGE worth alerting on.
     """
-    for task in ("loop_a_meta", "loop_b_rank"):
-        try:
-            ok, _ = preflight(route_for(task))
-        except Exception:
-            return False
-        if not ok:
-            return False
-    return True
+    try:
+        ok, info = preflight(route_for(task))
+    except Exception as err:
+        return False, f"{type(err).__name__}: {err}"[:200]
+    return ok, ("" if ok else info)
+
+
+def check_availability(site: str, task: str) -> tuple[bool, str, bool]:
+    """agent_available(task), logged to seo_run_log (loop=f"{task}_preflight") and compared
+    against the previous check for this (site, task) so callers can tell a NEW failure or
+    recovery from a standing state they already alerted on.
+
+    Built because a broken model route failed silently: preflight failures only ever hit
+    stderr in a cron log nobody reads day to day, so a lapsed claude CLI subscription session
+    went a full week unnoticed (2026-09-07's Loop B run skipped ranking with no one the wiser
+    until the next session). Callers should alert on `changed`, not on every `not ok` —
+    run_loop_a_on_publish polls every 10 minutes, and alerting each poll on a standing outage
+    would just be spam.
+
+    Returns (ok, reason, changed).
+    """
+    loop = f"{task}_preflight"
+    prev = db.get_last_run_status(site, loop)
+    ok, reason = agent_available(task)
+    status = "ok" if ok else "skipped"
+    run_id = db.start_run(site, loop)
+    db.end_run(run_id, status, None if ok else reason)
+    changed = (not ok) if prev is None else (status != prev)
+    return ok, reason, changed
 
 # The hard YMYL rule, injected into every content-generation prompt.
 YMYL_BOUNDARY = (

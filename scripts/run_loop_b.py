@@ -27,6 +27,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-discord", action="store_true")
     args = ap.parse_args(argv)
 
+    cfg = load_site_config(f"config/{args.site}.yaml" if args.site else None)
+    slug = site_slug(cfg)
+
     # 1. gsc_pull — measures and upserts seo_weekly (per_url + cwv_field); owns the loop_b run-log.
     gsc_argv: list[str] = []
     if args.site:
@@ -48,22 +51,31 @@ def main(argv: list[str] | None = None) -> int:
     elif not agent.WIRED:
         print("[loop_b] agent step not wired yet (deferred) — deterministic pull + render only. "
               "opportunities/editorial_gaps stay empty until the agent runs.", file=sys.stderr)
-    elif not agent.agent_available():
-        print("[loop_b] agent unavailable (no ANTHROPIC_API_KEY / claude CLI) — skipping ranking step.",
-              file=sys.stderr)
     else:
-        cfg = load_site_config(f"config/{args.site}.yaml" if args.site else None)
-        slug = site_slug(cfg)
-        weekly = db.get_latest_weekly(slug)
-        if not weekly:
-            print("[loop_b] no weekly row to rank (gsc_pull produced nothing) — skipping.",
+        ok, reason, changed = agent.check_availability(slug, "loop_b_rank")
+        if not ok:
+            print(f"[loop_b] loop_b_rank route unreachable ({reason}) — skipping ranking step.",
                   file=sys.stderr)
+            if changed:
+                render_report.alert(cfg, slug,
+                    f"⚠️ Loop B ranking unavailable: {reason}\n"
+                    "This week's opportunities/editorial_gaps will stay empty until this clears "
+                    "— check the routed model (config/models.yaml `loop_b_rank`) and its "
+                    "runtime. Won't alert again until this changes state.")
         else:
-            try:
-                agent.run_loop_b_ranking(cfg, slug, str(weekly["run_date"]), weekly)
-            except Exception as err:
-                print(f"[loop_b] ranking step failed, nothing ranked this run: {err}",
+            if changed:
+                render_report.alert(cfg, slug,
+                    "✅ Loop B ranking is back — model route reachable again.")
+            weekly = db.get_latest_weekly(slug)
+            if not weekly:
+                print("[loop_b] no weekly row to rank (gsc_pull produced nothing) — skipping.",
                       file=sys.stderr)
+            else:
+                try:
+                    agent.run_loop_b_ranking(cfg, slug, str(weekly["run_date"]), weekly)
+                except Exception as err:
+                    print(f"[loop_b] ranking step failed, nothing ranked this run: {err}",
+                          file=sys.stderr)
 
     # 3. render — projection of Postgres -> reports/<date>.md (+ Discord).
     if not args.no_render:

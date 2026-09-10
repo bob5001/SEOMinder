@@ -41,7 +41,6 @@ import sys
 
 from . import agent, audit, checklist, db, render_report, wp_mcp
 from .config import load_site_config, site_slug
-from .models import preflight, route_for
 
 
 def discover_new(cfg: dict, slug: str) -> list[dict]:
@@ -159,13 +158,24 @@ def main(argv: list[str] | None = None) -> int:
     if not agent.WIRED:
         print("[on_publish] agent.WIRED is False — nothing to do.", file=sys.stderr)
         return 0
-    # Scoped to loop_a_meta only — agent.agent_available() also preflights loop_b_rank, which
-    # this script has no business depending on.
-    ok, info = preflight(route_for("loop_a_meta"))
+    # Scoped to loop_a_meta only — this script has no business depending on loop_b_rank.
+    # check_availability (not the bare agent_available) because this poller runs every 10
+    # minutes: alerting on `changed` rather than on every `not ok` means a standing outage
+    # pings Discord once, not every cycle.
+    ok, reason, changed = agent.check_availability(slug, "loop_a_meta")
+    discord_on = not args.no_discord and cfg.get("reporting", {}).get("discord")
     if not ok:
-        print(f"[on_publish] loop_a_meta route unreachable ({info}) — skipping this poll.",
+        print(f"[on_publish] loop_a_meta route unreachable ({reason}) — skipping this poll.",
               file=sys.stderr)
+        if changed and discord_on:
+            render_report.alert(cfg, slug,
+                f"⚠️ Loop A on-publish is unable to run: {reason}\n"
+                "New posts will publish without automatic Yoast metadata until this clears — "
+                "check the routed model (config/models.yaml `loop_a_meta`) and its runtime. "
+                "Won't alert again until this changes state.")
         return 0
+    if changed and discord_on:
+        render_report.alert(cfg, slug, "✅ Loop A on-publish is back — model route reachable again.")
 
     new_items = discover_new(cfg, slug)
     if not new_items:

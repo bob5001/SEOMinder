@@ -31,6 +31,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-discord", action="store_true")
     args = ap.parse_args(argv)
 
+    cfg = load_site_config(f"config/{args.site}.yaml" if args.site else None)
+    slug = site_slug(cfg)
+
     # 1. audit — measures and upserts seo_page_state; owns the loop_a run-log entry.
     audit_argv: list[str] = []
     if args.site:
@@ -53,29 +56,38 @@ def main(argv: list[str] | None = None) -> int:
     elif not agent.WIRED:
         print("[loop_a] agent step not wired (agent.WIRED is False) — deterministic audit + "
               "render only.", file=sys.stderr)
-    elif not agent.agent_available():
-        print("[loop_a] routed model unreachable (preflight failed) — skipping proposal step.",
-              file=sys.stderr)
     else:
-        cfg = load_site_config(f"config/{args.site}.yaml" if args.site else None)
-        slug = site_slug(cfg)
-        pages = db.list_page_state(slug)
-        if args.url:
-            pages = [p for p in pages if p["url"] == args.url]
-        missing = [p["url"] for p in pages if not p.get("content_excerpt")]
-        if missing:
-            print(f"[loop_a] {len(missing)} page(s) have no content_excerpt — re-run audit "
-                  f"before proposing, or the model writes metadata blind.", file=sys.stderr)
-        try:
-            summary = agent.run_loop_a_fixes(cfg, slug, pages, apply=args.apply)
-            print(agent.render_proposals(summary, pages, cfg))
-        except NotImplementedError as err:
-            print(f"[loop_a] {err}", file=sys.stderr)
-            return 2
-        except RuntimeError as err:
-            # Reconciliation failure: nothing was written, by design.
-            print(f"[loop_a] proposal rejected, nothing written — {err}", file=sys.stderr)
-            return 1
+        ok, reason, changed = agent.check_availability(slug, "loop_a_meta")
+        if not ok:
+            print(f"[loop_a] loop_a_meta route unreachable ({reason}) — skipping proposal step.",
+                  file=sys.stderr)
+            if changed:
+                render_report.alert(cfg, slug,
+                    f"⚠️ Loop A metadata step unavailable: {reason}\n"
+                    "Proposals will keep being skipped until this clears — check the routed "
+                    "model (config/models.yaml `loop_a_meta`) and its runtime. Won't alert "
+                    "again until this changes state.")
+        else:
+            if changed:
+                render_report.alert(cfg, slug,
+                    "✅ Loop A metadata step is back — model route reachable again.")
+            pages = db.list_page_state(slug)
+            if args.url:
+                pages = [p for p in pages if p["url"] == args.url]
+            missing = [p["url"] for p in pages if not p.get("content_excerpt")]
+            if missing:
+                print(f"[loop_a] {len(missing)} page(s) have no content_excerpt — re-run audit "
+                      f"before proposing, or the model writes metadata blind.", file=sys.stderr)
+            try:
+                summary = agent.run_loop_a_fixes(cfg, slug, pages, apply=args.apply)
+                print(agent.render_proposals(summary, pages, cfg))
+            except NotImplementedError as err:
+                print(f"[loop_a] {err}", file=sys.stderr)
+                return 2
+            except RuntimeError as err:
+                # Reconciliation failure: nothing was written, by design.
+                print(f"[loop_a] proposal rejected, nothing written — {err}", file=sys.stderr)
+                return 1
 
     # 3. render — projection of Postgres -> reports/<date>.md (+ Discord).
     if not args.no_render:

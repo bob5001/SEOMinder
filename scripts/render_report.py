@@ -185,6 +185,20 @@ def post_discord(webhook: str, content: str) -> None:
     r.raise_for_status()
 
 
+def alert(cfg: dict, slug: str, text: str) -> None:
+    """One-off Discord notification for something a human should see NOW, outside the regular
+    digest cadence — e.g. a routed model going unreachable/recovering
+    (scripts.agent.check_availability). A no-op if Discord isn't configured or has no webhook
+    for this site. Callers decide whether the moment is alert-worthy (usually: a state CHANGE,
+    not every check of a standing outage) before calling this — it always posts.
+    """
+    if not cfg.get("reporting", {}).get("discord"):
+        return
+    webhook, _source = resolve_webhook(cfg, slug)
+    if webhook:
+        post_discord(webhook, text)
+
+
 # --- orchestration ----------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:

@@ -86,6 +86,20 @@ def end_run(run_id: str, status: str, error: str | None = None) -> None:
         )
 
 
+def get_last_run_status(site: str, loop: str) -> str | None:
+    """Most recent seo_run_log.status for (site, loop) — None if there's no prior row.
+
+    Used to detect a CHANGE in a routed model's availability (scripts.agent.check_availability)
+    rather than re-alerting on every check of a standing outage. idx_run_log_recent covers this
+    lookup (site, loop, started_at DESC)."""
+    rows = query(
+        "SELECT status FROM seo_run_log WHERE site = %s AND loop = %s "
+        "ORDER BY started_at DESC LIMIT 1",
+        (site, loop),
+    )
+    return rows[0]["status"] if rows else None
+
+
 # --- seo_page_state (Loop A) -----------------------------------------------
 
 def _upsert(table: str, conflict_cols: list[str], key: dict[str, Any], fields: dict[str, Any]) -> None:
