@@ -153,6 +153,21 @@ run_status          text            # ok | partial | failed
 digest_sent         bool
 ```
 
+### `seo_backlinks` — one row per (site, manual snapshot), logged by a human
+```
+site               text  pk        # -> sites.site
+snapshot_date      date  pk        # composite PK (site, snapshot_date); upsert-by-date
+referring_domains  int
+total_backlinks    int
+new_domains        json            # [{domain}] noted this snapshot
+notes              text
+logged_at          timestamptz     # defaults to now()
+```
+No automated puller: GSC's Links report (the free source) has no public API, and the providers
+that do (Ahrefs/Moz/Semrush) are paid tiers not worth it yet. Filled in via
+`python -m scripts.backlinks log`; `render_report.py` projects the trend (delta vs the prior
+snapshot) same as everything else here.
+
 ### `seo_run_log` — start/end record per invocation (the anti-rot record)
 ```
 run_id      uuid pk        # defaults to gen_random_uuid()
@@ -190,8 +205,16 @@ as a gap or a stuck `running` row — not a silent absence.
   server-side, so fetched HTML already contains content; no JS execution needed. 25k/day PSI limit is
   effectively unlimited here. Add a Playwright sidecar later only if a check needs a real browser.
 
+### `scripts/backlinks.py`  (manual authority tracking — no free API exists)
+- **In:** whatever you read off GSC's Links report (or any other source) yourself.
+- **Does:** `log` upserts one `seo_backlinks` snapshot by date; `show` prints the trend
+  (newest-first, delta vs the prior snapshot).
+- **Out:** `seo_backlinks` row(s). Nothing pulls this automatically — it's only as fresh as the
+  last time someone ran `log`.
+
 ### `scripts/render_report.py`  (presentation — projection of Postgres)
-- **In:** Postgres state (`seo_page_state`, latest `seo_weekly`) for a given `site`
+- **In:** Postgres state (`seo_page_state`, latest `seo_weekly`, latest 2 `seo_backlinks`) for a
+  given `site`
 - **Does:** reads Postgres → renders a structured md report into `reports/YYYY-MM-DD.md` → posts a
   summary to Discord via `DISCORD_WEBHOOK_URL`.
 - **Out:** committed md file + Discord message. Writes nothing back to Postgres.

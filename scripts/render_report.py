@@ -49,7 +49,8 @@ def _atleast(val, floor) -> bool | None:
 
 # --- markdown ---------------------------------------------------------------
 
-def render_md(cfg: dict, pages: list[dict], weekly: dict | None) -> str:
+def render_md(cfg: dict, pages: list[dict], weekly: dict | None,
+             backlinks: list[dict] | None = None) -> str:
     th = cfg.get("thresholds", {})
     t_lo, t_hi = th.get("title_len", {}).get("min", 50), th.get("title_len", {}).get("max", 60)
     m_lo, m_hi = th.get("metadesc_len", {}).get("min", 150), th.get("metadesc_len", {}).get("max", 160)
@@ -128,6 +129,32 @@ def render_md(cfg: dict, pages: list[dict], weekly: dict | None) -> str:
                  [f"- \"{g.get('query')}\" — {g.get('impressions')} impr → {g.get('suggested_page', 'new post')}"
                   for g in gaps] + [""]
 
+    # --- Backlinks: manual snapshots, no automated puller exists (GSC's Links report has no
+    # API; see scripts.backlinks) ---
+    L += ["## Backlinks (manual snapshots)", ""]
+    if not backlinks:
+        L += ["_None logged yet — `python -m scripts.backlinks log --help`._", ""]
+    else:
+        latest = backlinks[0]
+        prior = backlinks[1] if len(backlinks) > 1 else None
+
+        def _delta(cur, prev) -> str:
+            if cur is None or prev is None:
+                return ""
+            d = cur - prev
+            return f" ({'+' if d >= 0 else ''}{d} since {prior['snapshot_date']})"
+
+        rd, tb = latest.get("referring_domains"), latest.get("total_backlinks")
+        L.append(f"_As of {latest['snapshot_date']}_")
+        L.append(f"- referring domains: {rd}{_delta(rd, prior.get('referring_domains') if prior else None)}")
+        L.append(f"- total backlinks: {tb}{_delta(tb, prior.get('total_backlinks') if prior else None)}")
+        if latest.get("new_domains"):
+            doms = ", ".join(d.get("domain", "") for d in latest["new_domains"])
+            L.append(f"- new since last snapshot: {doms}")
+        if latest.get("notes"):
+            L.append(f"- note: {latest['notes']}")
+        L.append("")
+
     return "\n".join(L) + "\n"
 
 
@@ -142,7 +169,8 @@ def _top_movers(per_url: list[dict], n: int = 5) -> list[dict]:
 
 # --- Discord ----------------------------------------------------------------
 
-def discord_summary(cfg: dict, pages: list[dict], weekly: dict | None) -> str:
+def discord_summary(cfg: dict, pages: list[dict], weekly: dict | None,
+                    backlinks: list[dict] | None = None) -> str:
     name = cfg["site"]["name"]
     green = sum(1 for p in pages if p.get("checklist_status") == "green")
     lines = [f"**SEO digest — {name}** ({dt.date.today().isoformat()})",
@@ -153,6 +181,15 @@ def discord_summary(cfg: dict, pages: list[dict], weekly: dict | None) -> str:
         flags = [r for r in (weekly.get("per_url") or []) if r.get("indexed") is False]
         lines.append(f"Loop B: {len(weekly.get('per_url') or [])} pages · "
                      f"{len(opps)} opportunities · {len(flags)} indexing flag(s)")
+    if backlinks:
+        latest = backlinks[0]
+        prior = backlinks[1] if len(backlinks) > 1 else None
+        rd = latest.get("referring_domains")
+        delta = ""
+        if prior and rd is not None and prior.get("referring_domains") is not None:
+            d = rd - prior["referring_domains"]
+            delta = f" ({'+' if d >= 0 else ''}{d})"
+        lines.append(f"Backlinks: {rd} referring domain(s){delta} as of {latest['snapshot_date']}")
     return "\n".join(lines)
 
 
@@ -212,7 +249,8 @@ def main(argv: list[str] | None = None) -> int:
     slug = site_slug(cfg)
     pages = db.list_page_state(slug)
     weekly = db.get_latest_weekly(slug)
-    md = render_md(cfg, pages, weekly)
+    backlinks = db.list_backlinks(slug, limit=2)
+    md = render_md(cfg, pages, weekly, backlinks)
 
     if args.dry_run:
         print(md)
@@ -233,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[render_report] no webhook set (tried {webhook_env_name(slug)} then "
               f"DISCORD_WEBHOOK_URL) — skipping Discord post.", file=sys.stderr)
     else:
-        post_discord(webhook, discord_summary(cfg, pages, weekly))
+        post_discord(webhook, discord_summary(cfg, pages, weekly, backlinks))
         print(f"[render_report] posted Discord summary (via {source}).", file=sys.stderr)
     return 0
 

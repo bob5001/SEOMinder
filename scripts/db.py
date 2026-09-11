@@ -26,6 +26,7 @@ JSONB_COLUMNS: dict[str, set[str]] = {
     "seo_page_state": {"broken_links", "cwv_lab", "manual_queue", "changelog",
                        "lighthouse_seo_failures", "lighthouse_a11y_failures"},
     "seo_weekly": {"per_url", "opportunities", "editorial_gaps", "cwv_field"},
+    "seo_backlinks": {"new_domains"},
 }
 
 
@@ -147,3 +148,25 @@ def get_latest_weekly(site: str) -> dict | None:
         "SELECT * FROM seo_weekly WHERE site = %s ORDER BY run_date DESC LIMIT 1", (site,)
     )
     return rows[0] if rows else None
+
+
+# --- seo_backlinks (manual snapshots — no provider has a free API for this) ------------------
+
+def upsert_backlinks(site: str, snapshot_date: str, fields: dict[str, Any]) -> None:
+    _upsert("seo_backlinks", ["site", "snapshot_date"],
+            {"site": site, "snapshot_date": snapshot_date}, fields)
+
+
+def get_latest_backlinks(site: str) -> dict | None:
+    rows = query(
+        "SELECT * FROM seo_backlinks WHERE site = %s ORDER BY snapshot_date DESC LIMIT 1", (site,)
+    )
+    return rows[0] if rows else None
+
+
+def list_backlinks(site: str, limit: int = 12) -> list[dict]:
+    """Most recent snapshots, newest first — for a trend line, not just the latest point."""
+    return query(
+        "SELECT * FROM seo_backlinks WHERE site = %s ORDER BY snapshot_date DESC LIMIT %s",
+        (site, limit),
+    )
