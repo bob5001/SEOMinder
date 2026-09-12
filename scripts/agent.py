@@ -83,8 +83,9 @@ def check_availability(site: str, task: str) -> tuple[bool, str, bool]:
     stderr in a cron log nobody reads day to day, so a lapsed claude CLI subscription session
     went a full week unnoticed (2026-09-07's Loop B run skipped ranking with no one the wiser
     until the next session). Callers should alert on `changed`, not on every `not ok` —
-    run_loop_a_on_publish polls every 10 minutes, and alerting each poll on a standing outage
-    would just be spam.
+    run_loop_a_on_publish calls this once per newly-discovered item (not once per poll — see
+    its module docstring for why preflight must never run unconditionally), and alerting on
+    every `not ok` there would spam Discord once per queued item during a standing outage.
 
     Returns (ok, reason, changed).
     """

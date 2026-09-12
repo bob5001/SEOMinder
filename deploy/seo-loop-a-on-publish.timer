@@ -1,13 +1,16 @@
 # Short-interval poll, not a calendar trigger (contrast seo-loop-b.timer) — this is the
 # on-publish trigger: how close to real-time a newly-published post gets Loop A'd is exactly
 # this interval, since there's no WordPress-side webhook (see scripts.run_loop_a_on_publish's
-# module docstring for why). 10 minutes balances promptness against load on Ollama/WP MCP.
+# module docstring for why). Hourly (lowered from 10min 2026-09-12): the poll itself is just a
+# WordPress REST call, and run_loop_a_on_publish only touches the Ollama route once something
+# new is actually found — at this site's publish volume (~dozen/week) hourly costs nothing but
+# promptness we didn't need, and takes real load off Ollama/WP MCP.
 [Unit]
-Description=10-minute poll for Signal Sanctuary SEO Loop A on-publish trigger
+Description=Hourly poll for Signal Sanctuary SEO Loop A on-publish trigger
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=10min
+OnUnitActiveSec=1h
 Unit=seo-loop-a-on-publish.service
 
 [Install]

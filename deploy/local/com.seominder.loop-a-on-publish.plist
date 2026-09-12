@@ -14,11 +14,14 @@
         <string>/Users/robertkoch/Projects/SEOMinder/deploy/local/run-loop-a-on-publish.sh</string>
     </array>
 
-    <!-- Every 10 minutes — matches deploy/seo-loop-a-on-publish.timer's OnUnitActiveSec.
+    <!-- Hourly — matches deploy/seo-loop-a-on-publish.timer's OnUnitActiveSec. Lowered from
+         10 min (2026-09-12): this is a plain discovery poll (WP REST call) now, the model
+         route is only ever touched once something new is actually found, so hourly loses
+         nothing but promptness we didn't need at this site's publish volume (~dozen/week).
          AUTO-APPLIES to WordPress on anything new it finds, unattended, per the earlier
          design decision. -->
     <key>StartInterval</key>
-    <integer>600</integer>
+    <integer>3600</integer>
 
     <key>RunAtLoad</key>
     <true/>

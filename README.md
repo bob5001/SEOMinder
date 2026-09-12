@@ -58,7 +58,7 @@ Never gate: Yoast composite, Flesch, third-party DA/DR, vendor GEO scores.
 8. Install the systemd timer for Loop B; verify with `systemctl list-timers`. **Files ready
    (`deploy/seo-loop-b.{service,timer}`), not yet installed on the host — still open.**
 9. Install the systemd timer for Loop A's on-publish trigger (`deploy/seo-loop-a-on-publish.
-   {service,timer}`) — polls every 10 min, auto-applies. **Files ready, not yet installed.**
+   {service,timer}`) — polls hourly, auto-applies. **Files ready, not yet installed.**
 
 ## The agent step (built — the contract it actually honours)
 The loops' judgment + content-write half is `scripts/agent.py` (`WIRED=True`), model-agnostic —
@@ -89,7 +89,7 @@ docker compose run --rm loop-runner python -m scripts.run_loop_b
 # schedule Loop B (weekly):
 sudo cp deploy/seo-loop-b.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now seo-loop-b.timer
-# schedule Loop A on-publish (every 10 min, auto-applies to newly published content):
+# schedule Loop A on-publish (hourly, auto-applies to newly published content):
 sudo cp deploy/seo-loop-a-on-publish.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now seo-loop-a-on-publish.timer
 ```

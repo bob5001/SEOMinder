@@ -20,9 +20,12 @@ since Ollama runs under the logged-in user, not system-wide).
   `deploy/run-loop-b.sh` but calling the venv instead of `docker compose run`.
 - `com.seominder.loop-b.plist` — weekly, Monday 06:00 (matches `seo-loop-b.timer`'s
   `OnCalendar`).
-- `com.seominder.loop-a-on-publish.plist` — every 10 minutes (matches
-  `seo-loop-a-on-publish.timer`'s `OnUnitActiveSec`). **Auto-applies to WordPress** on anything
-  new it finds, unattended — same behavior as running it manually, just recurring.
+- `com.seominder.loop-a-on-publish.plist` — hourly (matches
+  `seo-loop-a-on-publish.timer`'s `OnUnitActiveSec`; lowered from 10 min 2026-09-12 — the poll
+  itself is a plain WP REST call, the Ollama route is only touched once something new is
+  actually found, so hourly loses nothing but unneeded promptness). **Auto-applies to
+  WordPress** on anything new it finds, unattended — same behavior as running it manually,
+  just recurring.
 
 Both plists set `RunAtLoad` true, so loading either fires an immediate first run — useful for
 verifying the setup without waiting for the next scheduled time, but know that loading

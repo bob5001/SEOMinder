@@ -3,9 +3,19 @@ unattended (auto-apply), for each item it hasn't seen before.
 
 Deliberately POLLING, not a WordPress webhook. This repo's whole execution model is a host
 systemd timer firing a one-shot container (INFRA.md: "No OpenClaw... plain systemd + flock")
-— never a listening service. A short-interval timer here (deploy/seo-loop-a-on-publish.timer,
-every 10 min) needs nothing on the WordPress side and no public endpoint on ours, unlike a
-webhook receiver would.
+— never a listening service. An hourly timer here (deploy/seo-loop-a-on-publish.timer) needs
+nothing on the WordPress side and no public endpoint on ours, unlike a webhook receiver would.
+On a site publishing on the order of a dozen posts a week, hourly is already far more prompt
+than the trigger needs to be.
+
+ORDERING MATTERS (fixed 2026-09-12, was backwards): discover_new() — a plain WordPress REST
+call — runs FIRST. agent.check_availability()/preflight only runs once discover_new() has
+found something to actually process. The earlier order called check_availability() on every
+single poll regardless of whether anything new existed, and that "cheap availability check"
+is a real completion call against the routed model (loop_a_meta -> ollama gemma4:31b-seo) —
+so it was loading a 20GB local model on every poll, all day, keeping it permanently resident
+in GPU memory (OLLAMA_KEEP_ALIVE=2h renewed faster than it could ever expire). Discovery is
+free; the model is not — always cheap-check before expensive-check.
 
 Discovery has NO separate watermark table: "new" means "a published item of
 scope.on_publish_post_type whose id is not yet a post_id in seo_page_state for this site."
@@ -158,10 +168,24 @@ def main(argv: list[str] | None = None) -> int:
     if not agent.WIRED:
         print("[on_publish] agent.WIRED is False — nothing to do.", file=sys.stderr)
         return 0
-    # Scoped to loop_a_meta only — this script has no business depending on loop_b_rank.
-    # check_availability (not the bare agent_available) because this poller runs every 10
-    # minutes: alerting on `changed` rather than on every `not ok` means a standing outage
-    # pings Discord once, not every cycle.
+
+    # Cheap check FIRST: a plain WordPress REST call, no model involved. Most polls end here.
+    new_items = discover_new(cfg, slug)
+    if not new_items:
+        print("[on_publish] nothing new.", file=sys.stderr)
+        return 0
+
+    if args.dry_run:
+        for item in new_items:
+            print(f"[on_publish] would process post_id={item['post_id']} {item['url']}")
+        return 0
+
+    # Only touch the model route once there's real work queued. Scoped to loop_a_meta only —
+    # this script has no business depending on loop_b_rank. check_availability (not the bare
+    # agent_available) so a standing outage still alerts on `changed` once rather than on every
+    # publish that lands while it's down — but preflight itself is a real completion call
+    # against the routed model, so it must never run unconditionally on every poll (see the
+    # module docstring for the bug this was).
     ok, reason, changed = agent.check_availability(slug, "loop_a_meta")
     discord_on = not args.no_discord and cfg.get("reporting", {}).get("discord")
     if not ok:
@@ -176,16 +200,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if changed and discord_on:
         render_report.alert(cfg, slug, "✅ Loop A on-publish is back — model route reachable again.")
-
-    new_items = discover_new(cfg, slug)
-    if not new_items:
-        print("[on_publish] nothing new.", file=sys.stderr)
-        return 0
-
-    if args.dry_run:
-        for item in new_items:
-            print(f"[on_publish] would process post_id={item['post_id']} {item['url']}")
-        return 0
 
     run_id = db.start_run(slug, "loop_a_on_publish")
     results = []
