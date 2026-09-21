@@ -152,7 +152,7 @@ python3 -m venv .venv && .venv/bin/pip install -r deploy/requirements.txt
 - **CrUX returns `no_data`** for this site (below CrUX's real-user traffic threshold) — expected and
   handled gracefully; field CWV is signal-only anyway.
 - **`checklist_status` is NULL until the Loop A agent runs** — `audit.py` measures; the agent judges.
-- **Neon**: project `SEOMinder` / `blue-firefly-95433128`, db `neondb`; `DATABASE_URL` in `.env`.
+- **Neon**: project `SEOMinder` (see Neon console for the project ID), db `neondb`; `DATABASE_URL` in `.env`.
 - **Pushes are the human's job**: the remote uses the `gh` HTTPS token as `bob5001` (the `github_neos`
   SSH key isn't registered on GitHub).
 - **The `claude` CLI isn't on the minimal PATH a scheduler provides.** `shutil.which("claude")`

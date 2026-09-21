@@ -41,7 +41,7 @@ GSC_SERVICE_ACCOUNT_JSON=secrets/gsc_sa.json        # relative to repo root (/ap
 GSC_PROPERTY=sc-domain:signalsanctuary.health
 PSI_API_KEY=                                         # PageSpeed Insights
 DATABASE_URL=postgresql://…neon.tech/neondb?sslmode=require   # Neon Postgres — the state store
-CODEMANAGER_URL=http://192.168.1.189:8007           # CodeManager broker (agent-knowledge), optional
+CODEMANAGER_URL=http://<codemanager-host>:8007           # CodeManager broker (agent-knowledge), optional
 WP_MCP_URL=https://signalsanctuary.health/wp-json/mcp/v1/http
 WP_MCP_TOKEN=
 DISCORD_WEBHOOK_URL=

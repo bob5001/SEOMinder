@@ -5,8 +5,10 @@ discipline from INFRA.md: the loop agent never touches Postgres directly — it 
 structured JSON and an orchestrator calls these helpers. `query()` additionally backs
 the agent's read-only query tool.
 
-Column identifiers below are internal constants (never user input), so they are safe to
-interpolate into SQL; all *values* are passed as bound parameters.
+Table and column identifiers are interpolated into SQL by `_upsert`, so they are checked
+against TABLE_COLUMNS first (fail-closed: unknown names raise ValueError before any SQL is
+built). That keeps model-derived dict keys from ever becoming SQL. All *values* are passed
+as bound parameters.
 """
 from __future__ import annotations
 
@@ -27,6 +29,27 @@ JSONB_COLUMNS: dict[str, set[str]] = {
                        "lighthouse_seo_failures", "lighthouse_a11y_failures"},
     "seo_weekly": {"per_url", "opportunities", "editorial_gaps", "cwv_field"},
     "seo_backlinks": {"new_domains"},
+}
+
+# Identifier allowlist for _upsert — mirrors the live Neon schema (there are no schema files in
+# this repo). When you add a column in Neon, add it here too, or upserts touching it will raise.
+TABLE_COLUMNS: dict[str, frozenset[str]] = {
+    "seo_page_state": frozenset({
+        "site", "url", "post_id", "page_type", "title", "title_len", "metadesc", "metadesc_len",
+        "h1_count", "heading_order_ok", "alt_coverage_pct", "internal_links_out",
+        "internal_links_in", "lighthouse_seo_pass", "lighthouse_a11y_pass", "indexable",
+        "schema_type", "schema_valid", "broken_links", "cwv_lab", "checklist_status",
+        "manual_queue", "last_audited_at", "changelog", "content_excerpt", "content_sha",
+        "lighthouse_seo_failures", "lighthouse_a11y_failures", "yoast_readability_score",
+    }),
+    "seo_weekly": frozenset({
+        "site", "run_date", "gsc_window", "per_url", "opportunities", "editorial_gaps",
+        "cwv_field", "run_status", "digest_sent",
+    }),
+    "seo_backlinks": frozenset({
+        "site", "snapshot_date", "referring_domains", "total_backlinks", "new_domains", "notes",
+        "logged_at",
+    }),
 }
 
 
@@ -104,6 +127,12 @@ def get_last_run_status(site: str, loop: str) -> str | None:
 # --- seo_page_state (Loop A) -----------------------------------------------
 
 def _upsert(table: str, conflict_cols: list[str], key: dict[str, Any], fields: dict[str, Any]) -> None:
+    allowed = TABLE_COLUMNS.get(table)
+    if allowed is None:
+        raise ValueError(f"_upsert: table {table!r} is not in TABLE_COLUMNS")
+    unknown = ({*key, *fields, *conflict_cols}) - allowed
+    if unknown:
+        raise ValueError(f"_upsert: unknown column(s) for {table}: {sorted(unknown)}")
     fields = _wrap_jsonb(table, {k: v for k, v in fields.items() if k not in key})
     cols = list(key.keys()) + list(fields.keys())
     vals = list(key.values()) + list(fields.values())
