@@ -297,9 +297,13 @@ def _complete_claude_cli(prov, model, system, prompt, schema, max_tokens, sampli
       * No API dollars. `claude` authenticates with the logged-in subscription.
       * It is just another adapter, so the model-neutral seam is unchanged.
 
-    The cost is per-call overhead: the CLI ships its own large system prompt (~17k cached
-    tokens per invocation) and has a multi-second floor latency. Fine for 11 pages once a
-    week; the bake-off measures whether a local model makes even that unnecessary.
+    The cost is per-call overhead and a multi-second floor latency. Left to its defaults the
+    CLI is a full agent: its own system prompt, tool definitions and ~/.claude/CLAUDE.md come
+    to ~39k input tokens per call, and with tools available the model has wandered off to grep
+    the repo and act on CLAUDE.md instructions mid-ranking. `--tools ""` removes the tools
+    (`--allowedTools ""` does NOT — it only changes permissions), and `--system-prompt`
+    replaces the agent prompt and drops CLAUDE.md; together ~3.6k tokens, measured 2026-10-26.
+    `--bare` would be cleaner still but never reads the subscription OAuth login.
 
     CRITICAL: ANTHROPIC_API_KEY is scrubbed from the subprocess environment. scripts.config
     loads .env into this process, and the CLI prefers an API key over the subscription — so
@@ -311,9 +315,9 @@ def _complete_claude_cli(prov, model, system, prompt, schema, max_tokens, sampli
 
     argv = [exe, "-p", prompt, "--output-format", "json", "--model", model,
             # No tools: this is one-shot structured generation, not an agent loop.
-            "--allowedTools", "", "--strict-mcp-config"]
-    if system:
-        argv += ["--append-system-prompt", system]
+            "--tools", "", "--strict-mcp-config",
+            # Always replace the agent prompt; an empty value would fall back to the default.
+            "--system-prompt", system or "Follow the user's instructions exactly."]
 
     env_ = {k: v for k, v in os.environ.items()
             if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
@@ -321,7 +325,14 @@ def _complete_claude_cli(prov, model, system, prompt, schema, max_tokens, sampli
     proc = subprocess.run(argv, capture_output=True, text=True,
                           timeout=prov.get("timeout_s", 300), env=env_)
     if proc.returncode != 0:
-        raise RuntimeError(f"claude CLI exited {proc.returncode}: {proc.stderr.strip()[:500]}")
+        # With --output-format json the CLI reports failures (auth lapses included) in the stdout
+        # envelope and leaves stderr empty, so surface both or the error reads as a bare "exited 1".
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        try:
+            detail = str(json.loads(proc.stdout).get("result")) or detail
+        except (ValueError, AttributeError):
+            pass
+        raise RuntimeError(f"claude CLI exited {proc.returncode}: {detail[:500]}")
 
     envelope = json.loads(proc.stdout)
     if envelope.get("is_error"):
